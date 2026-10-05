@@ -2,11 +2,11 @@
 
 Xunbu 是一套面向多相机光学动捕和手部跟踪的 Windows 上位机系统，覆盖相机采集、标定、二维检测、多视角三角化、时序跟踪、手部骨架估计、数据录制回放以及 Unity 接入。
 
-> Main repository: [lina130/Mocap_System](https://github.com/lina130/Mocap_System)
+> Main repository: [MiaomiaoYuHao/Mocap_System](https://github.com/MiaomiaoYuHao/Mocap_System)
 
 ## Demo
 
-[观看 / 下载 Demo 视频](https://github.com/lina130/Mocap_System/blob/main/demo/Xunbu%20Demo%E6%9C%80%E7%BB%88%E7%89%88.mp4)
+[观看 / 下载 Demo 视频](https://github.com/MiaomiaoYuHao/Mocap_System/blob/main/demo/Xunbu%20Demo%E6%9C%80%E7%BB%88%E7%89%88.mp4)
 
 Demo 视频位于 `demo/`，使用 Git LFS 保存。
 

@@ -1,0 +1,942 @@
+--- src/estimate/HandSkeletonAssociator.hpp	2026-08-21 14:40:14.000000000 +0000
++++ /home/claude/work/patched/estimate/HandSkeletonAssociator.hpp	2026-08-22 09:37:16.874439835 +0000
+@@ -34,6 +34,9 @@
+ #include <limits>
+ #include <algorithm>
+ 
++#include "estimate/DorsumRigidSolver.hpp"
++#include "estimate/Hm20SegRot.hpp"
++
+ namespace mocap {
+ namespace hm20 {
+ 
+@@ -374,9 +377,12 @@
+ //
+ // 【v6 模型仍然能跑】后端按名字请求，缺的头会在 verifyContract 里被标出来，
+ // 对应字段保持 has*=false，上层退回原来的几何路径。
+-inline const std::array<const char*, 5>& kOnnxOutputNames() {
+-    static const std::array<const char*, 5> n = {
+-        "log_assign", "pos", "joint_ang", "hand_logit", "pose_conf"};
++inline const std::array<const char*, 6>& kOnnxOutputNames() {
++    // 【只能往尾部加】Hm20OnnxBackend 里到处用 slot("名字") 反查下标，
++    // 但 Run() 的返回值是按这个数组的【顺序】排的，插在中间会让所有
++    // 已有的解析整体错位。
++    static const std::array<const char*, 6> n = {
++        "log_assign", "pos", "joint_ang", "hand_logit", "pose_conf", "seg_rot6d"};
+     return n;
+ }
+ 
+@@ -402,6 +408,16 @@
+     std::array<double, 5> poseConf{};      // 逐指姿态置信度(logit，未过 sigmoid)
+     bool  hasPoseConf = false;
+ 
++    // 16 段姿态，【手掌规范系】—— 不是世界系。
++    // 实测(tools/hm20_diag/probe_thumb_axis.py 打在 hm20_v7 上)：把输入点云整体
++    // 旋转平移之后 seg_rot6d 完全不变(seg0 与单位阵夹角 0.15°，旋转后变化 0.12°)，
++    // 所以 segR[0] 恒为单位阵、其余是相对手掌的姿态。转世界系要：
++    //     R_world(s) = wristR · C · segR[s]
++    // C 是"你的模板系 -> 网络规范系"的常数，用 Hm20SegRot.hpp 里的
++    // SegCanonAligner 从四指标一次即可。
++    std::array<Mat3, kNumSegments> segR{};
++    bool  hasSegR = false;
++
+     bool ok = false;
+ };
+ 
+@@ -481,6 +497,10 @@
+     Predicted = 1,   // 两端 marker 都是网络 pos 头补的，只能当"大概在哪"用
+     Geometry  = 2,   // 由真观测 marker 的连线算出（有 ~10° 贴球系统偏差）
+     Ik        = 3,   // IK 解出（该指可见 marker >= 2 且残差合格），最可信
++    Net       = 4,   // 网络 seg_rot6d 头直接给的姿态 + 标定出来的常数修正。
++                     // 【不经过 marker 差分】—— 这是它相对 Predicted 的唯一优势：
++                     // Predicted 是拿两个补出来的点做差，误差被骨长一除就放大；
++                     // Net 不需要那两个点。默认关着，见 cfg_.thumbSegFromNet。
+ };
+ 
+ struct SkeletonFrameResult {
+@@ -497,6 +517,7 @@
+     // 拇指预测点回正的执行情况。thumbFixed = 本帧回正了几个点；
+     // thumbFixSkip: 0=正常执行 1=参数为0 2=拇指三点全实测(不需要)
+     //               3=无腕部位姿 4=手背<3点 5=已执行但用的是退化锚点 6=掌骨轴退化
++    //               7=拇指部分可见(链条中间有实测点，转它会拧断链，交给 IK)
+     int thumbFixed = 0;
+     int thumbFixSkip = 0;
+     // 遮挡点的位置来源分账：走 IK 摆出来的 / 退回网络 pos 头预测的。
+@@ -510,6 +531,12 @@
+     int dorsumTrackN = 0;            // 手背轨迹已累积帧数
+     int dorsumTrackFixed = 0;        // 本帧被轨迹投票【纠正】的手背点数
+     int dorsumGeoRelabeled = 0;      // 本帧被几何重定过标签(累计计数)
++    // ---- 手背刚体求解（取代 relabelDorsumByGeometry + trackDorsum）----
++    // 0=ok 1=候选点不足 2=无可行解 3=歧义拒解 4=残差超限
++    int  dorsumSolveReason = 1;
++    bool dorsumUsedHistory = false;  // true = 裕度不够，靠位姿连续性拍板的
++    int  dorsumInliers     = 0;      // 本帧刚体解用了几个内点(3..5)
++    int  netThumbSegs      = 0;      // 本帧有几段拇指用了网络 seg_rot6d
+ 
+     // ---- v7 姿态版：模型直接给出的姿态/手性，不经过任何几何链 ----
+     // 【为什么原样透传】几何链在观测充分时更准(实测张开手中节 5° 以内，
+@@ -541,6 +568,110 @@
+ 
+ // ===========================================================================
+ // 主类
++// ---------------------------------------------------------------------------
++// 标定 C（模板系 -> 网络规范系）和 K_s（拇指三段的常数修正）
++//
++// 用法（每帧，在 process() 之后；inf 是那一帧的 InferenceOutput）：
++//     aligner.feed(result, inf);
++// 攒够之后：
++//     Mat3 C; if (aligner.solveC(C)) { ... }
++//     std::array<Mat3,3> K; if (aligner.solveThumbK(C, K)) { ... }
++//
++// 然后拇指遮挡帧用：
++//     R_world(s) = wristR · C · segR[s] · K[s-1]      (s = 1,2,3)
++// ---------------------------------------------------------------------------
++class SegCanonAligner {
++public:
++    struct Config {
++        int    minSamples   = 200;
++        double maxSpreadDeg = 15.0;   // 超过它说明假设不成立，别用
++    };
++    void setConfig(const Config& c) { cfg_ = c; }
++    void reset() { cSamp_.clear(); for (auto& v : kRaw_) v.clear(); }
++
++    int  cCount() const { return int(cSamp_.size()); }
++    int  kCount() const { return int(kRaw_[0].size()); }
++
++    // 【只收干净帧】C 用四指(它们的几何解可信)，K 用拇指三颗球全见的帧。
++    void feed(const SkeletonFrameResult& r, const InferenceOutput& inf) {
++        if (!r.valid || !r.wristPoseValid || !inf.hasSegR) return;
++        const Mat3 Wt = matT3(r.wristR);
++
++        // ---- C：四指的几何段。C = (wristRᵀ · R_geo(s)) · segR[s]ᵀ ----
++        for (int f = 1; f < 5; ++f) {
++            for (int j = 0; j < 3; ++j) {
++                const int s = 1 + 3*f + j;
++                if (r.segSource[size_t(s)] != SegSource::Geometry) continue;
++                const Mat3 Rg = quatToMat3(r.segQuat[size_t(s)]);
++                cSamp_.push_back(matMul3(matMul3(Wt, Rg), matT3(inf.segR[size_t(s)])));
++            }
++        }
++        if (cSamp_.size() > 4000) cSamp_.erase(cSamp_.begin(), cSamp_.begin() + 2000);
++
++        // ---- K：拇指三段，只在三颗球全见时收 ----
++        bool thumbFull = true;
++        for (int m = 5; m <= 7; ++m) if (!r.markers[size_t(m)].observed) thumbFull = false;
++        if (thumbFull) {
++            for (int j = 0; j < 3; ++j) {
++                const int s = 1 + j;
++                if (r.segSource[size_t(s)] != SegSource::Geometry) continue;
++                kRaw_[size_t(j)].push_back({quatToMat3(r.segQuat[size_t(s)]), r.wristR,
++                                            inf.segR[size_t(s)]});
++                if (kRaw_[size_t(j)].size() > 2000)
++                    kRaw_[size_t(j)].erase(kRaw_[size_t(j)].begin(),
++                                           kRaw_[size_t(j)].begin() + 1000);
++            }
++        }
++    }
++
++    bool solveC(Mat3& C, double* spreadDeg = nullptr) const {
++        if (int(cSamp_.size()) < cfg_.minSamples) return false;
++        RotationAverager ra;
++        for (const Mat3& R : cSamp_) ra.add(R);
++        if (!ra.mean(C)) return false;
++        const double sp = ra.spreadDeg(cSamp_);
++        if (spreadDeg) *spreadDeg = sp;
++        return sp >= 0.0 && sp <= cfg_.maxSpreadDeg;
++    }
++
++    // K[j] 对应 segment 1+j（拇指 掌骨/近节/远节）
++    bool solveThumbK(const Mat3& C, std::array<Mat3, 3>& K,
++                     std::array<double, 3>* spreadDeg = nullptr) const {
++        for (int j = 0; j < 3; ++j) {
++            const auto& v = kRaw_[size_t(j)];
++            if (int(v.size()) < cfg_.minSamples) return false;
++            RotationAverager ra;
++            std::vector<Mat3> samp;
++            samp.reserve(v.size());
++            for (const Raw& x : v) {
++                // K = (wristR·C·segR)ᵀ · R_geo
++                const Mat3 pred = matMul3(matMul3(x.wristR, C), x.segR);
++                const Mat3 k = matMul3(matT3(pred), x.Rgeo);
++                samp.push_back(k);
++                ra.add(k);
++            }
++            if (!ra.mean(K[size_t(j)])) return false;
++            const double sp = ra.spreadDeg(samp);
++            if (spreadDeg) (*spreadDeg)[size_t(j)] = sp;
++            if (sp < 0.0 || sp > cfg_.maxSpreadDeg) return false;
++        }
++        return true;
++    }
++
++    // 诊断用：K 相对单位阵的转角。如果拇指先验没问题它该接近 0；
++    // 实测应该是 70~90° —— 那正是 rig 缺掉的常数旋前。
++    static double offsetDeg(const Mat3& K) {
++        return RotationAverager::angleDeg(Mat3{{1,0,0, 0,1,0, 0,0,1}}, K);
++    }
++
++private:
++    struct Raw { Mat3 Rgeo; Mat3 wristR; Mat3 segR; };
++    Config cfg_{};
++    std::vector<Mat3> cSamp_;
++    std::array<std::vector<Raw>, 3>  kRaw_;
++};
++
++
+ // ===========================================================================
+ struct Hm20Config {
+     // 低于此概率的指派当作没认领，走补全。
+@@ -632,7 +763,25 @@
+     // 正确，正解与次解残差差 7.63mm。详见 relabelDorsumByGeometry()。
+     bool   dorsumGeoRelabel      = true;
+     double dorsumGeoMinMarginMm  = 2.0;   // 次解-正解 的残差差下限，不够就不动
+-    bool   dorsumTracklet    = true;
++    // 【改默认为 false】trackDorsum() 会把几十帧前的旧位置写回 markers 并
++    // 置 observed=true —— 凭空创造观测。贪心最近邻门限 25mm/帧，手腕平移超过
++    // 它就全部匹配失败、轨迹再也更新不了，5 个点被永久钉死在旧位置且回不来。
++    // 由 dorsumRigidSolve 完整取代。
++    bool   dorsumTracklet    = false;
++    // 手背改成刚体求解：在【全部候选点】里搜，"谁是手背点"和"是哪一个"一起解，
++    // 不依赖模型的手背分类。取代 dorsumGeoRelabel + dorsumTracklet 两条路。
++    bool   dorsumRigidSolve  = true;
++    // 拇指段在【几何/IK 都不可信】的帧改用网络 seg_rot6d + 标定常数。
++    // 【默认关】它依赖两个还没在真数据上验过的假设：
++    //   ① C(模板系->网络规范系)在整个会话里是常数
++    //   ② K_s(拇指段的常数修正)也是常数
++    // 两个都由 Hm20SegRot.hpp 的 SegCanonAligner 标定并自带 spreadDeg 自检。
++    // 先看 spread <= 15° 且 offsetDeg(K) 落在 70~90°(= rig 缺掉的那个常数旋前)
++    // 再打开 —— 对不上说明前面某个假设错了，硬接只会把一个错误换成另一个。
++    bool   thumbSegFromNet   = false;
++    // 是否每帧累积网络段常数的标定样本。开着只是往环形缓冲里塞数据，
++    // 不影响出帧；标定完可以关掉。
++    bool   netSegCalib       = false;
+     double dorsumTrackGateMm = 25.0;   // 帧间匹配门限。手背点间距 20mm+，
+                                        // 帧间位移亚毫米，25mm 足够宽又不会配错
+     int    dorsumTrackWarm   = 20;     // 攒够多少帧才敢用投票覆盖单帧结果
+@@ -671,6 +820,65 @@
+     void setDorsumTracklet(bool on) { cfg_.dorsumTracklet = on; }
+     void setDorsumGeoRelabel(bool on) { cfg_.dorsumGeoRelabel = on; }
+     void resetDorsumTracklet() { trkInit_ = false; trkFrames_ = 0; }
++    void setDorsumRigidSolve(bool on) { cfg_.dorsumRigidSolve = on; }
++    void setThumbSegFromNet(bool on) { cfg_.thumbSegFromNet = on; }
++    // 注入 Hm20SegRot.hpp 里 SegCanonAligner 标定出来的两个常数。
++    // 没注入之前 thumbSegFromNet 即使打开也不会生效（netConstValid_ 为假）。
++    void setNetSegConstants(const Mat3& C, const std::array<Mat3, 3>& K) {
++        netC_ = C; netK_ = K; netConstValid_ = true;
++    }
++    void clearNetSegConstants() { netConstValid_ = false; }
++    bool netSegConstantsValid() const { return netConstValid_; }
++
++    // ---- 网络段常数的在线标定 ----
++    // 【为什么放在关联器内部】标定要同时看到 out(几何解) 和 inf(网络的 segR)，
++    // 而 InferenceOutput 只在 process() 里活着。放外面就得把它整个端到 worker
++    // 层，接口变宽还容易忘记同步；放里面一行 feed 就完事。
++    void setNetSegCalib(bool on) { cfg_.netSegCalib = on; }
++    int  netSegCSamples() const { return segAlign_.cCount(); }
++    int  netSegKSamples() const { return segAlign_.kCount(); }
++    void resetNetSegCalib() { segAlign_.reset(); }
++
++    struct NetSegCalibReport {
++        bool ok = false;
++        double cSpreadDeg = -1.0;
++        std::array<double, 3> kSpreadDeg{{-1, -1, -1}};
++        std::array<double, 3> kOffsetDeg{{-1, -1, -1}};   // K 相对单位阵的转角
++        int cSamples = 0, kSamples = 0;
++        const char* why = "还没跑";
++    };
++
++    // 解算并安装两个常数。返回的 report 里 kOffsetDeg 是【交叉验证点】：
++    // probe_thumb_axis.py 量到模型的拇指铰链轴缺口是 73°，如果这里解出来的
++    // K 转角落在 70~90°，说明两条互不依赖的路给出了同一个结论；
++    // 如果它接近 0 或者散得离谱，说明前面某个假设错了，别开 thumbSegFromNet。
++    NetSegCalibReport solveNetSegConstants() {
++        NetSegCalibReport r;
++        r.cSamples = segAlign_.cCount();
++        r.kSamples = segAlign_.kCount();
++        Mat3 C{};
++        if (!segAlign_.solveC(C, &r.cSpreadDeg)) {
++            r.why = (r.cSamples < 200) ? "C 的样本不够(要 200+，四指几何段)"
++                                       : "C 的离散度超 15°：模板系->规范系不是常数，假设不成立";
++            return r;
++        }
++        std::array<Mat3, 3> K{};
++        if (!segAlign_.solveThumbK(C, K, &r.kSpreadDeg)) {
++            r.why = (r.kSamples < 200) ? "K 的样本不够(要 200+，拇指三球全见的帧)"
++                                       : "K 的离散度超 15°：拇指段的修正不是常数，别用";
++            return r;
++        }
++        for (int j = 0; j < 3; ++j) r.kOffsetDeg[size_t(j)] = SegCanonAligner::offsetDeg(K[size_t(j)]);
++        setNetSegConstants(C, K);
++        r.ok = true;
++        r.why = "OK";
++        return r;
++    }
++    void resetDorsumRigid() { dorsum_.resetHistory(); dorsumPoseOk_ = false; }
++    // 面板要显示的那个数：手背模板"最优错解"的 Kabsch 残差。
++    // <3mm = 布局病态（近似共面 + 近似反序对称），该去重贴点而不是继续调参数。
++    // 标定一次算一次，不在每帧路径上。
++    double dorsumSelfAmbiguityMm() const { return dorsum_.selfAmbiguityMm(); }
+     void setThumbPronation(double rad) { cfg_.thumbPronationRad = rad; }
+     double thumbPronation() const { return cfg_.thumbPronationRad; }
+     void resetHistory() { hasPrev_ = false; }
+@@ -764,7 +972,7 @@
+         out.numObserved = int(std::count(seen.begin(), seen.end(), true));
+ 
+         // ---- 手背标签重定：把这件事从模型手里拿走，交给几何 ----
+-        relabelDorsumByGeometry(out, seen);
++        solveDorsumRigid(out, seen, candidates, N);
+ 
+         // ---- 手背 tracklet：跨帧跟踪 + 标签投票 ----
+         // 【为什么专门给手背做】它是刚体，跨帧的物理球就是同一批；而单帧
+@@ -779,7 +987,7 @@
+         //
+         // 【为什么不做硬判定】投票是软的：证据不足时保持上一次的结论，
+         // 不强行每帧重选。这对应文献里的"多假设、不做硬判定"。
+-        trackDorsum(out, seen);
++        // trackDorsum(out, seen);   // 【已停用】见 Hm20Config::dorsumTracklet
+ 
+         // ---- 【解耦点】在这里就把 prev 定下来，用【网络原始输出】 ----
+         // 姿态侧的后处理（拇指回正、链式续解、遮挡限速、时序滤波）从这一行
+@@ -809,29 +1017,27 @@
+         // 四元数帧间跳变的最大值从 3.7° 冲到 102.2° —— 手一动腕就乱转。
+         // 宁可这一帧不给腕部位姿（wristPoseValid=false，下游沿用上一帧或
+         // 走 IK），也不要给一个被手指姿态污染的错值。
++        // 【2026-08 改】不再在这里单独跑一次 Kabsch。solveDorsumRigid() 已经用
++        // 它自己挑出来的内点解出了 R,t —— 这里再解一次的话，"用哪几个点"的选择
++        // 跟求解器不一致（它按内点、这里按 seen），缺点时两边会得到不同的位姿，
++        // 而下游(IK/anchor/骨轴)全部建在 wristR 上，两套位姿会打架。
+         wristPoseValid_ = false;
+-        // 【修复】必须同时有毫米模板才解 Kabsch，见 tmplMarker() 的说明
+-        if (tmplValid_ && tmplMmValid_) {
+-            std::vector<Vec3> src, dst;
+-            for (int m = 0; m < 5; ++m) if (seen[size_t(m)]) {
+-                src.push_back(tmplMarker(m));
+-                dst.push_back(out.markers[size_t(m)].posWorld);
+-            }
+-            if (src.size() >= 3) {
+-                out.dorsumRmseMm = kabsch(src, dst, out.wristR, out.wristT);
+-                wristPoseValid_ = true;
+-                lastWristR_ = out.wristR;
+-                lastWristT_ = out.wristT;
+-                hasLastWrist_ = true;
+-            } else if (hasLastWrist_) {
+-                // 沿用上一帧的腕部位姿。dorsumRmseMm 保持 -1，调用方据此
+-                // 知道这一帧的腕部姿态是外推的、不是本帧解出来的。
+-                out.wristR = lastWristR_;
+-                out.wristT = lastWristT_;
+-                out.message = "手背可见点 <3，腕部位姿沿用上一帧";
+-            } else {
+-                out.message = "手背可见点 <3 且无历史，腕部位姿未解出";
+-            }
++        if (dorsumPoseOk_) {
++            out.wristR = dorsumR_;
++            out.wristT = dorsumT_;
++            out.dorsumRmseMm = out.dorsumGeoRmseMm;
++            wristPoseValid_ = true;
++            lastWristR_ = out.wristR;
++            lastWristT_ = out.wristT;
++            hasLastWrist_ = true;
++        } else if (hasLastWrist_) {
++            // 沿用上一帧。dorsumRmseMm 保持 -1，调用方据此知道这一帧的腕部
++            // 姿态是外推的、不是本帧解出来的。
++            out.wristR = lastWristR_;
++            out.wristT = lastWristT_;
++            out.message = "手背刚体未解出，腕部位姿沿用上一帧";
++        } else {
++            out.message = "手背刚体未解出且无历史，腕部位姿未解出";
+         }
+         out.wristPoseValid = wristPoseValid_;
+         out.wristQuat = matToQuat(out.wristR);
+@@ -914,6 +1120,10 @@
+             }
+         }
+ 
++        // ---- 6b. 拇指段的网络兜底（默认关，见 cfg_.thumbSegFromNet）----
++        if (cfg_.netSegCalib) segAlign_.feed(out, inf);
++        applyNetThumbSegments(out, inf);
++
+         // 【退档要可见】遮挡点走 IK 还是退回 AI 预测，原来是隐式的：某根手指
+         // fingerValid=false 或残差超门限时会静默退档，而两者的误差特性差很远
+         // (IK 骨轴 max 71° vs AI 108°)。不上报的话，"这一帧到底用的哪条路"
+@@ -1384,6 +1594,94 @@
+         ++out.dorsumGeoRelabeled;
+     }
+ 
++    // -------------------------------------------------------------------------
++    // 手背刚体求解 —— 取代 relabelDorsumByGeometry() + trackDorsum()
++    //
++    // 【跟被取代的两条路的区别】
++    //   · relabelDorsumByGeometry 只在模型给出的那 5 个手背点之间做排列，
++    //     且要求 5 个全被认领。模型把手指点/杂点判成手背时它无从发现；
++    //     缺一个点就完全不动。
++    //   · trackDorsum 用点位移(25mm 门限)做跨帧关联，快速运动下必然丢锁，
++    //     丢锁之后没有恢复路径，还会把旧位置写回并谎称 observed=true。
++    //   · 这里改成：在【全部候选点】里做刚体匹配，"谁是手背点"和"是哪一个"
++    //     一起解；歧义时用【位姿连续性】破(反序错解对应腕部转~180°，一票否决)，
++    //     冷启动没有历史时用手指落点破；都用不上就【拒解】，绝不猜。
++    //
++    // 【为什么必须能拒解】手背 5 点近似共面 + 近似反序对称时，反序错解的
++    // Kabsch 残差只比正解高 1.8mm 左右，跟观测噪声同量级。单帧看残差就是抛
++    // 硬币，而抛错一次腕部系整个翻 180°，全手的连线一起错。宁可这一帧没有
++    // 腕部位姿(wristPoseValid=false，下游沿用上一帧)，也不要一个翻过去的。
++    // -------------------------------------------------------------------------
++    void solveDorsumRigid(SkeletonFrameResult& out,
++                          std::array<bool, kNumMarkers>& seen,
++                          const std::vector<std::pair<int, Vec3>>& candidates, int N) {
++        dorsumPoseOk_ = false;      // 【必须在最前面】后面每条 return 都靠它表示"没解出来"
++        out.dorsumGeoRmseMm   = -1.0;
++        out.dorsumGeoMarginMm = -1.0;
++        out.dorsumGeoFixed    = 0;
++        out.dorsumInliers     = 0;
++        out.dorsumSolveReason = 1;
++        if (!cfg_.dorsumRigidSolve || !tmplMmValid_) return;
++
++        if (!dorsum_.templateValid()) {
++            std::array<Vec3, 5> T{};
++            for (int m = 0; m < 5; ++m) T[size_t(m)] = tmplMm_[size_t(m)];
++            dorsum_.setTemplate(T);
++            std::array<Vec3, 15> F{};
++            for (int m = 0; m < 15; ++m) F[size_t(m)] = tmplMm_[size_t(m + 5)];
++            dorsum_.setFingerTemplate(F);      // 冷启动歧义靠它破
++        }
++
++        std::vector<Vec3> pts;
++        pts.reserve(size_t(N));
++        for (int i = 0; i < N; ++i) pts.push_back(candidates[size_t(i)].second);
++
++        // 手指点只用于【歧义仲裁】，不参与刚体拟合
++        std::vector<DorsumRigidSolver::FingerObs> fobs;
++        for (int m = 5; m < kNumMarkers; ++m)
++            if (seen[size_t(m)])
++                fobs.push_back(DorsumRigidSolver::FingerObs{m, out.markers[size_t(m)].posWorld});
++
++        const DorsumSolveResult r = dorsum_.solve(pts, fobs);
++        out.dorsumGeoRmseMm   = r.rmseMm;
++        out.dorsumGeoMarginMm = r.marginMm;
++        out.dorsumSolveReason = r.reason;
++        out.dorsumUsedHistory = r.usedHistory;
++        out.dorsumInliers     = r.nMatched;
++
++        if (!r.ok) {
++            // 【解不出来就承认解不出来】不要退回模型的手背标签——那正是要替掉的
++            // 东西。5 个手背标签全部标成未观测，第 4 步会自然走"沿用上一帧"。
++            for (int m = 0; m < 5; ++m) {
++                seen[size_t(m)] = false;
++                out.markers[size_t(m)].observed = false;
++                out.markers[size_t(m)].confidence = 0.0;
++                out.markers[size_t(m)].sourcePointId = -1;
++            }
++            return;
++        }
++
++        for (int k = 0; k < 5; ++k) {
++            const int j = r.pointOf[size_t(k)];
++            if (j >= 0) {
++                if (out.markers[size_t(k)].sourcePointId != candidates[size_t(j)].first)
++                    ++out.dorsumGeoFixed;
++                out.markers[size_t(k)] = SkeletonMarker{k, candidates[size_t(j)].second, true, 1.0,
++                                                        candidates[size_t(j)].first};
++                seen[size_t(k)] = true;
++            } else {
++                // 没匹配上的手背点：用刚体位姿反投影补。比网络 pos 头准(这一帧的
++                // 刚体位姿刚被别的点解出来)，但【必须标未观测】——它是补的不是测的。
++                out.markers[size_t(k)] = SkeletonMarker{k, dorsum_.project(r.R, r.t, k), false, 0.0, -1};
++                seen[size_t(k)] = false;
++            }
++        }
++        dorsumR_ = r.R;
++        dorsumT_ = r.t;
++        dorsumPoseOk_ = true;
++        dorsum_.acceptHistory(r.R);      // 存成下一帧的连续性参考
++    }
++
+     void trackDorsum(SkeletonFrameResult& out,
+                      const std::array<bool, kNumMarkers>& seen) const {
+         using namespace detail;
+@@ -1515,9 +1813,24 @@
+ 
+         // 有没有需要回正的点？三颗全是实测就没什么可做的（这是【正常】状态，
+         // 不是错误：拇指没被遮住的时候本来就不该动它）。
+-        bool any = false;
+-        for (int m = 5; m <= 7; ++m) if (!seen[size_t(m)]) any = true;
+-        if (!any) { out.thumbFixSkip = 2; return; }
++        int nSeen = 0;
++        for (int m = 5; m <= 7; ++m) if (seen[size_t(m)]) ++nSeen;
++        if (nSeen == 3) { out.thumbFixSkip = 2; return; }
++
++        // 【2026-08 收紧】只在拇指三颗球【全部】未观测时才动手。
++        //
++        // 旧行为是"只转 observed==false 的点"，链条中间有实测点时会把链拧断：
++        // 掌骨球(5)、近节球(6)实测、远节球(7)预测 —— 这是最常见的遮挡形态 ——
++        // 只把 7 绕掌骨轴转 80°，5/6 原地不动，于是
++        //     近节骨轴 = p7 - p5   远节骨轴 = p7 - p6
++        // 两个方向都不再有物理意义。实测面板上"拇 近节"的相对父节点四元数
++        // 对应 118°，而拇指 MCP 的解剖限位只有 0.95 rad = 54° —— 这个数字本身
++        // 就说明链是断的，不是偏的。
++        //
++        // 旋前是整条 CMC 后链的刚体自转，只有整条链一起转才自洽。
++        // 部分遮挡的情形交给 IK(markerFK 里的 thumbPronation0)去补 ——
++        // 那条路是用真实观测约束着解的，不会凭空拧断链条。
++        if (nSeen != 0) { out.thumbFixSkip = 7; return; }
+ 
+         if (!wristPoseValid_) { out.thumbFixSkip = 3; return; }         // 没腕部系，转轴无从谈起
+ 
+@@ -1701,6 +2014,52 @@
+     //   近节 prox: (anchor 或 pp) -> mp        anchor 来自模板，只要 wristPoseValid 就算已知
+     //   中节 mid : pp -> dp
+     //   远节 dist: mp -> dp
++    // -------------------------------------------------------------------------
++    // 拇指三段改用网络 seg_rot6d。
++    //
++    // 【只在几何和 IK 都不可信的段上生效】拇指三颗球全见时几何解是好的，
++    // IK 合格时 IK 更好；这条路是给"拇指被遮住"那 55% 的帧兜底的。
++    //
++    // 【为什么它比现在的 Predicted 好】Predicted 段的骨轴 = 两个【网络补出来的
++    // 点】之差。补点的误差被骨长(20~30mm)一除就放大成角度误差。seg_rot6d 直接
++    // 给姿态，不需要那两个点，误差不经过这一步放大。
++    //
++    // 【为什么还需要 K_s】seg_rot6d 跟 pos 头训练自同一个 rig，而那个 rig 的
++    // 拇指缺了常数旋前(实测铰链轴只偏 17.4°，真人要 80~90°)。所以网络给的拇指
++    // 姿态本身也是外翻的，需要一个常数修正。好消息是这个常数可以从【拇指三球
++    // 全见的帧】上量出来(见 Hm20SegRot.hpp 的 SegCanonAligner)，手性自动正确。
++    //
++    // 【统一走 boneFrame】跟 IK 覆盖那段同样的理由：不同来源各自的 roll 约定
++    // 不一样，混着用会让手指在"这一帧走网络、下一帧退回几何"时四元数整个翻过去。
++    // 而 roll 在每节只有 1 颗球时本来就不可观测，两套谁也不比谁更真。
++    // -------------------------------------------------------------------------
++    void applyNetThumbSegments(SkeletonFrameResult& out, const InferenceOutput& inf) {
++        using namespace detail;
++        out.netThumbSegs = 0;
++        if (!cfg_.thumbSegFromNet || !netConstValid_) return;
++        if (!inf.hasSegR || !out.wristPoseValid) return;
++
++        for (int j = 0; j < 3; ++j) {
++            const int seg = 1 + j;
++            // 几何/IK 可信就别动它
++            const SegSource src = out.segSource[size_t(seg)];
++            if (src == SegSource::Geometry || src == SegSource::Ik) continue;
++
++            // R = wristR · C · segR[seg] · K[j]
++            const Mat3 a = matMul(out.wristR, netC_);
++            const Mat3 b = matMul(a, inf.segR[size_t(seg)]);
++            const Mat3 R = matMul(b, netK_[size_t(j)]);
++            const Vec3 axis{R[0], R[3], R[6]};             // 列 0 = 骨轴
++            if (!(norm(axis) > 1e-6)) continue;
++            out.segQuat[size_t(seg)] =
++                matToQuat(boneFrame(axis, out.wristR, prevSegY_[size_t(seg)],
++                                    segRollOffset(seg, cfg_.thumbRollOffsetRad)));
++            out.segSource[size_t(seg)] = SegSource::Net;
++            out.segConf[size_t(seg)] = 0.6;               // 比几何低、比纯预测高
++            ++out.netThumbSegs;
++        }
++    }
++
+     static void markSegmentSources(SkeletonFrameResult& out) {
+         out.segSource[0] = out.wristPoseValid ? SegSource::Geometry : SegSource::None;
+         out.segConf[0]   = out.wristPoseValid ? 1.0 : 0.0;
+@@ -1856,7 +2215,18 @@
+     mutable std::array<double, 5> dipK_{};      // 在线学到的 dip/pip 耦合比
+     mutable std::array<double, 5> mdLen_{};     // 中节球->远节球的实测间距
+     mutable std::array<bool, kNumMarkers> chainFilledThisFrame_{};
+-    // 手背 tracklet 状态：5 条轨迹的位置 + 各自对 5 个标签的票数
++    // 网络段姿态的两个标定常数（模板系->规范系 C，拇指三段的常数修正 K）
++    Mat3 netC_{1,0,0, 0,1,0, 0,0,1};
++    std::array<Mat3, 3> netK_{};
++    bool netConstValid_ = false;
++    SegCanonAligner netSegAlignHolder_;   // 见 segAlign_
++    SegCanonAligner& segAlign_ = netSegAlignHolder_;
++    // 手背刚体求解状态
++    DorsumRigidSolver dorsum_;
++    Mat3 dorsumR_{1,0,0, 0,1,0, 0,0,1};
++    Vec3 dorsumT_{};
++    bool dorsumPoseOk_ = false;
++    // 手背 tracklet 状态：5 条轨迹的位置 + 各自对 5 个标签的票数【已停用，见 cfg_.dorsumTracklet】
+     mutable std::array<Vec3, 5> trkPos_{};
+     mutable std::array<bool, 5> trkHas_{};
+     mutable std::array<std::array<int, 5>, 5> trkVote_{};
+--- src/estimate/Hm20IkRefiner.hpp	2026-08-13 06:46:20.000000000 +0000
++++ /home/claude/work/patched/estimate/Hm20IkRefiner.hpp	2026-08-22 05:13:13.880420094 +0000
+@@ -101,6 +101,30 @@
+     // 这就是拇指 anchor 误差(14.8mm)比四指(2.6~3.8mm)差 4 倍的主因。
+     // 由 Hm20AutoCalib 的束调整解出来，解不出来时退回这个群体均值。
+     double thumbAxialK = 0.576;
++
++    // 第一掌骨的【常数】解剖旋前(rad)。0 = 完全沿用旧行为。
++    //
++    // 【rig 缺了什么】训练用的 hand_rig.py 里旋前完全耦合在 CMC 外展上
++    // (axial = thumb_axial_k * a[1])，没有常数基线：握拳时 CMC展=0.18、
++    // k∈[0.35,0.80] -> 旋前只有 4~8°。而真人第一掌骨【中立位就有】80~90°
++    // 旋前 —— 这正是拇指能对掌的原因。
++    //
++    // 【实测】拿 hm20_v7.onnx 的 seg_rot6d 头量它自己学到的屈曲铰链轴
++    // (tools/hm20_diag/probe_thumb_axis.py，60 组自洽样本)：
++    //     四指  与 +Y 轴差 0.3~1.7°，离散度 1.7~4.2°
++    //     拇指  与 +Y 轴差 17.4°，   离散度 29.0°
++    // 真人拇指应该差 80~90°，缺口约 73°。所以模型和 rig 都把拇指当成了
++    // 第五根手指，往掌面压但不横过手掌 —— 这就是"外翻/不往手心弯"。
++    //
++    // 【后果不只是姿态难看】markerFK 摆不出一个对掌的拇指，于是拇指 IK 的
++    // 残差常年超 ikMaxRmseMm、fingerValid[0] 恒 false(面板上的"拇✗")，
++    // 而且自标定的球面拟合会把这 73° 的系统误差当噪声吸进球心 ——
++    // 这就是"拇指 anchor 误差 9~14mm、四指只有 3mm"的谜底。
++    //
++    // 【符号】refine() 内部已把左手镜像成右手系再解(obsL/anchorL/backL 一起
++    // 翻 Y)，所以这个常数在 markerFK 里【跟手性无关】，不要在这里翻号。
++    // 幅值 ~1.4~1.57 rad。符号请用 ThumbPronationCalib 扫出来，别靠眼睛。
++    double thumbPronation0 = 0.0;
+ };
+ 
+ // -----------------------------------------------------------------------------
+@@ -201,7 +225,7 @@
+     // 根关节旋转：先外展(Z)再屈曲(Y)。拇指额外带 CMC 外展耦合出的轴向旋前。
+     M3 R = mul(rotZ(q[1]), rotY(q[0]));
+     if (finger == 0)
+-        R = mul(R, rotX(mm.thumbAxialK * q[1]));
++        R = mul(R, rotX(mm.thumbPronation0 + mm.thumbAxialK * q[1]));
+ 
+     // 该段【远端】关节角，决定皮肤滑移量
+     const double jointAng[3] = {q[0], q[2], q[3]};
+@@ -267,6 +291,12 @@
+     // 拇指轴向旋前耦合系数（逐人）。见 Hm20MarkerModel::thumbAxialK 的说明。
+     void setThumbAxialK(double k) { mm_.thumbAxialK = std::clamp(k, 0.20, 1.00); }
+     double thumbAxialK() const { return mm_.thumbAxialK; }
++    // 拇指第一掌骨的常数解剖旋前。见 Hm20MarkerModel::thumbPronation0。
++    // 【跟 thumbRollOffsetRad 的区别】那个作用在 roll 上，而 roll 在每节只有
++    // 1 颗球时【不可观测】，所以永远没有数字能告诉你调对没有；这个作用在
++    // marker 位置上，是【可观测】的 —— fingerIkRmseMm[0] 就是它的判据。
++    void setThumbPronation0(double rad) { mm_.thumbPronation0 = std::clamp(rad, -2.0, 2.0); }
++    double thumbPronation0() const { return mm_.thumbPronation0; }
+     bool isRight() const { return isRight_; }
+ 
+     void setFingerParams(int f, const Vec3& anchor, const std::array<double, 3>& len) {
+--- src/estimate/SkeletonAssocWorker.hpp	2026-08-21 14:40:14.000000000 +0000
++++ /home/claude/work/patched/estimate/SkeletonAssocWorker.hpp	2026-08-22 09:38:41.641708056 +0000
+@@ -76,6 +76,17 @@
+                                     // false 表示沿用上一帧，segQuat[0] 不可信
+     int numGhost = 0;               // 被判为 dustbin 的候选点数
+     double dorsumRmseMm = -1.0;     // 手背 Kabsch 残差，<0 表示没解
++    // ---- 手背刚体求解 ----
++    int    dorsumInliers    = 0;    // 本帧刚体解用了几个内点(3..5)
++    double dorsumMarginMm   = -1.0; // 最优解与次优【不同标签】解的残差差
++    int    dorsumReason     = 1;    // 0=ok 1=候选不足 2=无可行解 3=歧义拒解 4=残差超限
++    bool   dorsumByHistory  = false;// 裕度不够、靠位姿连续性拍板的
++    // 手背模板"最优错解"的 Kabsch 残差。标定一次算一次，不随帧变。
++    // 【这是这一屏最该看的数】<3mm = 贴点布局近似共面+近似反序对称，
++    // 几何判据本身分不清正解和反序，任何算法都会来回翻 —— 该去重贴点，
++    // 而不是继续在软件里调参数。
++    double dorsumSelfAmbMm  = -1.0;
++    int    netThumbSegs     = 0;    // 本帧有几段拇指用了网络 seg_rot6d
+     bool pentagonOk = false;        // 手背五边形自交校验
+ 
+     // ---- 自标定 ----
+@@ -222,6 +233,20 @@
+     // 手背标签用几何重定（穷举 120 种排列 + Kabsch）。仿真实测噪声 0.9mm 时
+     // 定标签准确率 100%，而模型的手背逐点准确率只有 91~96%。
+     void setDorsumGeoRelabel(bool on) { geoRelabel_.store(on); thumbRollDirty_.store(true); }
++    // 手背刚体求解：在全部候选点里搜，取代 geoRelabel + tracklet 两条路。
++    void setDorsumRigidSolve(bool on) { dorsumRigid_.store(on); thumbRollDirty_.store(true); }
++    // 拇指段走网络 seg_rot6d 的两个开关。calib 只是攒样本、不影响出帧；
++    // fromNet 才真正改输出，而且没标定出常数之前打开也不会生效。
++    void setNetSegCalib(bool on)   { netSegCalib_.store(on);  thumbRollDirty_.store(true); }
++    void setThumbSegFromNet(bool on){ thumbSegNet_.store(on); thumbRollDirty_.store(true); }
++    // 拇指第一掌骨的常数解剖旋前(rad)。
++    // 【为什么单独一条下发路径，不跟 thumbRoll_ 合并】thumbRollDirty_ 那条路上
++    // 挂着 sgn = handIsRight ? +1 : -1 的翻号逻辑，而 thumbPronation0 在
++    // markerFK 里【不该跟手性翻号】—— Hm20IkRefiner::refine() 内部已经把左手
++    // 观测/anchor/backTemplate 一起镜像成右手系再解了。混在一起会造出
++    // "面板切一下手性，拇指 IK 突然全废"这种坑。
++    void setThumbPronation0(double rad) { thumbPron0_.store(rad); ikParamDirty_.store(true); }
++    double thumbPronation0() const { return thumbPron0_.load(); }
+     // 回正预测点的开关（量值跟 roll 共用一个参数）
+     void setThumbPronationOn(bool on) { thumbPronOn_.store(on); thumbRollDirty_.store(true); }
+     void setRateLimitEnabled(bool on) { rateLimitOn_.store(on); }
+@@ -294,10 +319,16 @@
+             // 映射成绕 M·n 转 -θ。所以同一个解剖旋前量，在左手上是反方向的。
+             // 面板上填的是【解剖量的绝对值】(80~90°)，这里按手性给符号 ——
+             // 否则左手用户会一路往正方向调、越调越错，永远找不到正确值。
+-            const double sgn = handIsRight_.load() ? 1.0 : -1.0;
++            // 【用 tmpl_.isRight 而不是面板值】applyHandedness 打开时
++            // tmpl_.isRight 可能是自标定推断出来的，而 ik->setHandedness() 用的
++            // 也是它。两边不统一的话会出现"IK 按左手解、拇指旋前按右手补"。
++            const double sgn = tmpl_.isRight ? 1.0 : -1.0;
+             assoc_->setThumbRollOffset(sgn * thumbRoll_.load());
+             assoc_->setOccludedIkOnly(ikOnly_.load());
+             assoc_->setDorsumGeoRelabel(geoRelabel_.load());
++            assoc_->setDorsumRigidSolve(dorsumRigid_.load());
++            assoc_->setNetSegCalib(netSegCalib_.load());
++            assoc_->setThumbSegFromNet(thumbSegNet_.load());
+             assoc_->setThumbPronation(thumbPronOn_.load() ? sgn * thumbRoll_.load() : 0.0);
+         }
+ 
+@@ -306,6 +337,12 @@
+             assoc_->setIkRefiner(ikEnabled_.load() ? pendingIk_ : nullptr);
+         }
+ 
++        // 拇指常数旋前：纯参数，跟手性无关，独立下发。见 setThumbPronation0()。
++        if (ikParamDirty_.exchange(false)) {
++            if (auto* ik = dynamic_cast<hm20::Hm20IkRefiner*>(pendingIk_.get()))
++                ik->setThumbPronation0(thumbPron0_.load());
++        }
++
+         // 模板热更新：只在 worker 线程里落地，避免和推理读写竞争。
+         if (tmplDirty_.exchange(false)) {
+             tmpl_ = tmplPending_;
+@@ -472,6 +509,12 @@
+             diag.wristPoseValid = result.wristPoseValid;
+             diag.numGhost       = result.numGhost;
+             diag.dorsumRmseMm   = result.dorsumRmseMm;
++            diag.dorsumInliers   = result.dorsumInliers;
++            diag.dorsumMarginMm  = result.dorsumGeoMarginMm;
++            diag.dorsumReason    = result.dorsumSolveReason;
++            diag.dorsumByHistory = result.dorsumUsedHistory;
++            diag.netThumbSegs    = result.netThumbSegs;
++            if (assoc_) diag.dorsumSelfAmbMm = assoc_->dorsumSelfAmbiguityMm();
+             diag.pentagonOk     = result.pentagonOk;
+             diag.ikActive       = result.ikApplied;
+             std::vector<double> rr;
+@@ -761,6 +804,11 @@
+     std::atomic<bool>   thumbPronOn_{true};
+     std::atomic<bool>   ikOnly_{true};
+     std::atomic<bool>   geoRelabel_{true};
++    std::atomic<bool>   dorsumRigid_{true};
++    std::atomic<bool>   netSegCalib_{false};
++    std::atomic<bool>   thumbSegNet_{false};
++    std::atomic<double> thumbPron0_{0.0};      // 0 = 沿用旧行为；标定后写入
++    std::atomic<bool>   ikParamDirty_{true};
+     bool   cfgAcceptGate_ = true;
+     double acceptMaxRigidStdMm_ = 3.0;   // |anchor-pp| σ 上限；观测噪声是 1~2mm
+     int    lastAcceptReject_ = 0;        // 0=通过 1=刚性σ不过
+--- src/estimate/Hm20OnnxBackend.hpp	2026-08-19 03:57:10.000000000 +0000
++++ /home/claude/work/patched/estimate/Hm20OnnxBackend.hpp	2026-08-22 09:23:36.261831806 +0000
+@@ -30,6 +30,7 @@
+ #pragma once
+ 
+ #include "estimate/HandSkeletonAssociator.hpp"
++#include "estimate/Hm20SegRot.hpp"   // rot6dToMat
+ #include "estimate/OrtRuntimeLoader.hpp"   // 必须在任何 Ort:: 之前，它定义 ORT_API_MANUAL_INIT
+ 
+ #include <algorithm>   // std::find —— verifyContract() 里按名字查输出用
+@@ -298,6 +299,18 @@
+                     out.hasPoseConf = true;
+                 }
+             }
++            // seg_rot6d (1,16,6) —— 唯一一条【不经过 marker 差分】的姿态来源。
++            // 拇指远节被遮挡时，它比"两个球做差"稳得多，因为它不需要那两个球。
++            const int iSr = slot("seg_rot6d");
++            if (valid(iSr) && haveOut_.seg) {
++                auto sh = res[size_t(iSr)].GetTensorTypeAndShapeInfo().GetShape();
++                if (sh.size() == 3 && sh[1] == kNumSegments && sh[2] == 6) {
++                    const float* sr = res[size_t(iSr)].GetTensorData<float>();
++                    for (int s = 0; s < kNumSegments; ++s)
++                        out.segR[size_t(s)] = rot6dToMat(&sr[size_t(s) * 6]);
++                    out.hasSegR = true;
++                }
++            }
+ 
+             out.ok = true;
+         } catch (const Ort::Exception& e) {
+--- src/estimate/Hm20AutoCalib.hpp	2026-08-15 11:11:46.000000000 +0000
++++ /home/claude/work/patched/estimate/Hm20AutoCalib.hpp	2026-08-22 09:33:49.218087596 +0000
+@@ -183,6 +183,10 @@
+     double thumbMinSpreadDeg  = 32.0;   // 近节球方向张角下限
+     double thumbMinDpRangeMm  = 70.0;   // 远节球在腕部系里的活动范围下限
+     bool   fitThumbAxialK     = true;
++    // 拇指常数旋前是【解剖常数】，一个人一辈子不变。建议标定一次之后把拟合值
++    // 填进 lockedThumbPronation0 并把这个关掉——每次会话重搜只会引入抖动。
++    bool   fitThumbPronation0 = true;
++    double lockedThumbPronation0 = 0.0;   // 非 0 时直接用它，不再搜
+ 
+     // ---- 左右手自动判定 ----
+     bool   detectHandedness   = true;
+@@ -281,6 +285,15 @@
+     bool   dorsumReordered = false;
+     double thumbAxialK   = 0.576;     // 拇指轴向旋前耦合（逐人）
+     bool   thumbAxialFitted = false;
++    // 第一掌骨的【常数】解剖旋前(rad)。见 Hm20MarkerModel::thumbPronation0。
++    // 【跟 thumbAxialK 的可辨识性完全不同】耦合项 = k*外展角，外展角一直很小时
++    // 任何 k 都差不多、搜出来是噪声，所以那个要 thumbCoverage()>=0.6 才敢搜；
++    // 而常数基线【中立位就在起作用】，只要拇指有过屈曲就能辨识，门松得多。
++    double thumbPronation0 = 0.0;
++    bool   thumbPronationFitted = false;
++    // 碗底对比度 = sqrt(最差档均方 / 最优档均方)。>=2 才算真搜到了东西；
++    // 接近 1 说明曲线是平的，量出来是噪声，此时不写入、保持 0(等价旧行为)。
++    double thumbPronationContrast = 0.0;
+     double bundleRmseMm  = -1.0;      // 束调整的整体拟合残差；<0 = 还没跑过
+     int    bundleShots   = 0;
+     double handLenMm     = 185.0;
+@@ -1317,6 +1330,7 @@
+         ang.resize(shots_.size());
+         double se = 0; int n = 0;
+         Hm20MarkerModel mm; mm.handLenMm = res_.handLenMm; mm.thumbAxialK = res_.thumbAxialK;
++        mm.thumbPronation0 = res_.thumbPronation0;
+         for (size_t i = 0; i < shots_.size(); ++i) {
+             std::array<Vec3, 20> obs = shots_[i].p;
+             if (!res_.isRight) for (auto& v : obs) v[1] = -v[1];   // 统一到右手系再解
+@@ -1340,6 +1354,7 @@
+         Hm20IkRefiner ik;
+         ik.setHandedness(true);        // shots 已经镜像成右手系
+         ik.setThumbAxialK(res_.thumbAxialK);
++        ik.setThumbPronation0(res_.thumbPronation0);
+         ik.setBackTemplate(res_.backMm);
+         for (int f = 0; f < 5; ++f)
+             ik.setFingerParams(f, res_.anchorsMm[size_t(f)], res_.lengthsMm[size_t(f)]);
+@@ -1351,7 +1366,9 @@
+         const auto anchor0 = res_.anchorsMm;
+         const auto len0 = res_.lengthsMm;
+         const double axial0 = res_.thumbAxialK;
++        const double pron0   = res_.thumbPronation0;
+         Hm20MarkerModel mm; mm.handLenMm = res_.handLenMm; mm.thumbAxialK = res_.thumbAxialK;
++        mm.thumbPronation0 = res_.thumbPronation0;
+ 
+         for (int it = 0; it < cfg_.bundleIters; ++it) {
+             // ---- (a) anchor 闭式解 ----
+@@ -1390,6 +1407,19 @@
+             // 覆盖度是 thumbAxialK 的【可辨识性】前提，不是精度偏好：
+             // 耦合项 = k * 外展角，外展角一直很小的话这一项恒接近 0，
+             // 此时任何 k 的残差都差不多，网格搜出来的是噪声。
++            // ---- (d0) 拇指常数旋前：先搜它，再搜耦合系数 ----
++            // 【顺序不能反】常数基线的量级(~80°)比耦合项(~5°)大一个数量级。
++            // 基线没补上时，耦合项的网格搜是在一个整体偏了 70° 的残差面上找
++            // 极小值，找到的是噪声。先定基线，耦合项才有意义。
++            if (std::fabs(cfg_.lockedThumbPronation0) > 1e-6) {
++                res_.thumbPronation0 = cfg_.lockedThumbPronation0;
++                res_.thumbPronationFitted = true;
++                mm.thumbPronation0 = res_.thumbPronation0;
++            } else if (cfg_.fitThumbPronation0) {
++                refineThumbPronation(ang, mm);
++                mm.thumbPronation0 = res_.thumbPronation0;
++            }
++            // ---- (d) 拇指轴向旋前耦合 ----
+             if (cfg_.fitThumbAxialK && thumbCoverage() >= 0.6) {
+                 refineThumbAxial(ang, mm);
+                 mm.thumbAxialK = res_.thumbAxialK;
+@@ -1399,6 +1429,7 @@
+         for (int f = 0; f < 5; ++f)
+             ik.setFingerParams(f, res_.anchorsMm[size_t(f)], res_.lengthsMm[size_t(f)]);
+         ik.setThumbAxialK(res_.thumbAxialK);
++        ik.setThumbPronation0(res_.thumbPronation0);
+         ik.setBackTemplate(res_.backMm);
+         std::vector<PerShotAngles> ang2 = ang;
+         const double rmse1 = bundleSolveAngles(ik, ang2);
+@@ -1408,6 +1439,7 @@
+             res_.anchorsMm = anchor0;
+             res_.lengthsMm = len0;
+             res_.thumbAxialK = axial0;
++            res_.thumbPronation0 = pron0;
+             res_.bundleRmseMm = rmse0;
+             return false;
+         }
+@@ -1419,6 +1451,66 @@
+         return true;
+     }
+ 
++    // -------------------------------------------------------------------------
++    // 拇指【常数】解剖旋前的一维搜索。
++    //
++    // 【为什么必须搜、不能填死】幅值能从解剖学推(80~90°)，也能从模型里量出来
++    // (tools/hm20_diag/probe_thumb_axis.py 在 hm20_v7 上量到的缺口是 73°)，
++    // 但【符号】取决于 rotX/rotY/rotZ 的约定、行主序、以及 refine() 内部镜像的
++    // 实现细节 —— 任何一处读错就是相反的结论，而符号错了会把 73° 的缺口变成
++    // 163°，比不补还差。所以只能让残差说话。
++    //
++    // 【判据是可观测量】这个参数作用在 marker 的【位置】上，位置是测得到的。
++    // 对比 thumbRollOffsetRad：那个作用在 roll(绕骨轴自转)上，而 roll 在每节
++    // 只有 1 颗球时【不可观测】—— 那个参数永远没有数字能告诉你调对没有。
++    //
++    // 【一定要看对比度】真解会有明显的碗底。曲线平(contrast<2)说明这批 shot 里
++    // 拇指没怎么动，此时不写入结果 —— 宁可保持 0(等价旧行为)也不要写进一个噪声。
++    // -------------------------------------------------------------------------
++    void refineThumbPronation(const std::vector<PerShotAngles>& ang, Hm20MarkerModel mm) {
++        auto cost = [&](double a) {
++            mm.thumbPronation0 = a;
++            double se = 0; int n = 0;
++            for (size_t i = 0; i < shots_.size(); ++i) {
++                const auto fk = markerFK(0, res_.anchorsMm[0], res_.lengthsMm[0],
++                                         ang[i].q[0], mm);
++                for (int j = 0; j < 3; ++j) {
++                    const int m = 5 + j;
++                    if (!shots_[i].ok[size_t(m)]) continue;
++                    Vec3 o = shots_[i].p[size_t(m)];
++                    if (!res_.isRight) o[1] = -o[1];
++                    const Vec3 d = sub(fk.marker[size_t(j)], o);
++                    se += dot(d, d); ++n;
++                }
++            }
++            return (n >= 18) ? se / n : 1e18;
++        };
++        double bestA = 0.0, bestC = cost(0.0), worstC = bestC;
++        if (bestC > 1e17) return;
++        for (int i = 0; i <= 36; ++i) {               // 粗搜 [-1.8, 1.8]，覆盖 ±103°
++            const double a = -1.80 + 0.10 * i;
++            const double c = cost(a);
++            if (c > 1e17) continue;
++            if (c < bestC) { bestC = c; bestA = a; }
++            if (c > worstC) worstC = c;
++        }
++        for (int i = -5; i <= 5; ++i) {               // 精搜 ±0.10 步长 0.02
++            const double a = bestA + 0.02 * i;
++            if (a < -2.0 || a > 2.0) continue;
++            const double c = cost(a);
++            if (c < 1e17 && c < bestC) { bestC = c; bestA = a; }
++        }
++        // cost 是均方，对比度要用 RMS 之比才有物理意义
++        res_.thumbPronationContrast = (bestC > 1e-9) ? std::sqrt(worstC / bestC) : 0.0;
++        if (res_.thumbPronationContrast >= 2.0) {
++            res_.thumbPronation0 = bestA;
++            res_.thumbPronationFitted = true;
++        } else {
++            res_.thumbPronation0 = 0.0;               // 曲线平：不写，保持旧行为
++            res_.thumbPronationFitted = false;
++        }
++    }
++
+     // 拇指轴向旋前耦合系数的一维搜索。
+     void refineThumbAxial(const std::vector<PerShotAngles>& ang, Hm20MarkerModel mm) {
+         auto cost = [&](double k) {
+@@ -1769,6 +1861,7 @@
+         Hm20MarkerModel mm;
+         mm.handLenMm = res_.handLenMm;
+         mm.thumbAxialK = res_.thumbAxialK;
++        mm.thumbPronation0 = res_.thumbPronation0;
+         const std::array<double, 4> zero{0, 0, 0, 0};
+         for (int f = 0; f < 5; ++f) {
+             const auto fk = markerFK(f, res_.anchorsMm[size_t(f)], res_.lengthsMm[size_t(f)], zero, mm);
+--- src/ui/PointCloudTestDialog.cpp	2026-08-21 14:40:14.000000000 +0000
++++ /home/claude/work/patched/ui/PointCloudTestDialog.cpp	2026-08-22 09:38:10.797744170 +0000
+@@ -2341,6 +2341,36 @@
+                         .arg(dropRatio*100.0, 0, 'f', 0);
+     }
+ 
++    // ---- 手背刚体求解状态：单独一行 ----
++    // 【为什么值得占一行】手背标签一翻，腕部系整个转 180°，全手的连线一起错，
++    // 但画面上看起来只是"手突然朝向不对"，很难跟"标签翻了"联系起来。
++    // 把内点数/残差/裕度摆出来，翻不翻当场可见。
++    if (diag.backendReady && diag.dorsumReason >= 0) {
++        static const char* kReason[5] = {
++            "", "候选点不足", "无可行解", "歧义拒解(本帧不给腕部位姿)", "残差超限"};
++        QString d;
++        if (diag.dorsumReason == 0) {
++            d = QStringLiteral("手背刚体：内点%1/5  残差%2mm  裕度%3mm%4")
++                    .arg(diag.dorsumInliers)
++                    .arg(diag.dorsumRmseMm, 0, 'f', 2)
++                    .arg(diag.dorsumMarginMm > 1e8 ? 999.0 : diag.dorsumMarginMm, 0, 'f', 1)
++                    .arg(diag.dorsumByHistory ? QStringLiteral("  [连续性仲裁]") : QString());
++        } else {
++            const int r = std::clamp(diag.dorsumReason, 0, 4);
++            d = QStringLiteral("手背刚体：未解出 —— %1").arg(QString::fromUtf8(kReason[r]));
++        }
++        if (diag.dorsumSelfAmbMm > 0.0) {
++            d += QStringLiteral("   自歧义%1mm%2")
++                     .arg(diag.dorsumSelfAmbMm, 0, 'f', 2)
++                     .arg(diag.dorsumSelfAmbMm < 3.0
++                              ? QStringLiteral(" ← 贴点布局病态，重贴比调参数管用")
++                              : QString());
++        }
++        if (diag.netThumbSegs > 0)
++            d += QStringLiteral("   拇指段走网络×%1").arg(diag.netThumbSegs);
++        fullText += QStringLiteral("\n") + d;
++    }
++
+     // ---- 自标定状态 ----
+     // 【单独一行、且必须显示"为什么没推进"】只给一个不动的进度条，用户完全
+     // 无从下手。autoReject 会直接说"手动得太快，请放慢"/"手背点没认全"这种

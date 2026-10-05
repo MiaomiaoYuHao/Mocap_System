@@ -1,0 +1,690 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 35c5330..b6b87fb 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -33,6 +33,7 @@ qt_add_executable(mocap_host
+     src/ui/PointCloudTestDialog_panel.cpp     # 【拆文件】buildParamSections（原构造 632~2379 行）
+     src/ui/PointCloudTestDialog_pipeline.cpp   # 【拆文件】析构/骨架结果/rebuild/录制文件头
+     src/ui/PointCloudTestDialog_capture.cpp   # 【拆文件】录制目录/采集/聚类 tryCluster
++    src/ui/PointCloudTestDialog_uievents.cpp  # 【拆文件】面板控件操作的全量事件记录
+     # 【新增】输出数据实时打印面板（点云面板右侧那块）。有 Q_OBJECT，
+     # AUTOMOC 会自动扫同名 .hpp，不需要额外写 moc 规则。
+     src/ui/HandOutputMonitor.cpp
+diff --git a/src/record/PointCloudRecorder.hpp b/src/record/PointCloudRecorder.hpp
+index 036975f..45a76c9 100644
+--- a/src/record/PointCloudRecorder.hpp
++++ b/src/record/PointCloudRecorder.hpp
+@@ -1184,6 +1184,24 @@ struct UdpOutRec {
+ //       ---- v7 ----
+ //       16=按下"ROM标定"（UI 线程，墙钟）   17=按下"结束ROM"（UI 线程，墙钟）
+ //       18=ROM 采样真正开始的那一帧          19=ROM 采样真正结束的那一帧
++//       ---- v8.1 ----
++//       20=面板控件被改动（任意勾选框/数值框/下拉框/按钮，带旧值→新值）
++//       21=录制开始     22=录制停止
++//
++// 【为什么 20 要覆盖"任意"控件，而不是挑几个重要的挑着记】
++// 面板上有 87 个控件，而 1Hz 的 runtimeConfig 只覆盖其中 26 个 ——
++// 剩下 61 个的值【在文件里一个字节都没有】。挑着记的问题在于：
++// 排查时真正想问的往往是"我中间是不是手贱动过什么"，而这个问题
++// 恰恰只有在【全都记】的前提下才答得出来。漏掉的那一个，
++// 按墨菲定律就是出问题的那一个。
++//
++// 而且逐帧的 RunFlags 只有 20 个布尔位、runtimeConfig 是 1Hz 采样：
++//   · 数值控件调了又调回来（1 秒内）在 runtimeConfig 里【完全看不见】
++//   · 就算看见了，也只知道"它变了"，不知道是【谁在什么墙钟时刻】动的，
++//     更不知道旧值是多少 —— 而"改回去"这个动作要靠旧值才能复现
++//
++// 21/22 记录开始/停止：文件头有开始时间，但"是正常停的还是出错停的"、
++// "停的时候队列里还压着多少"，以前一点痕迹都没有。
+ //
+ // 【16/17 和 18/19 为什么要分开记】按钮回调跑在 GUI 线程上，而
+ // romLearning_ 是原子标志，worker 线程要到下一帧才读到它。两者之间隔着一个
+diff --git a/src/ui/PointCloudTestDialog.cpp b/src/ui/PointCloudTestDialog.cpp
+index 3bfc066..51886b1 100644
+--- a/src/ui/PointCloudTestDialog.cpp
++++ b/src/ui/PointCloudTestDialog.cpp
+@@ -882,6 +882,14 @@ PointCloudTestDialog::PointCloudTestDialog(CameraManager* mgr, CalibrationStore*
+     });
+ 
+     rebuild();
++
++    // ---- 给面板上每一个控件接上操作事件（v8.1）----
++    // 【放在构造函数最末尾，不是 buildParamSections 末尾】它是一次性的
++    // findChildren 扫描，而 outputMonitor_ 在 buildParamSections 之后才建 ——
++    // 早调一步，那一整块的控件就【永远不会被记录】。这种"部分覆盖"是最坏的
++    // 情况：事件流看起来完整、实际有洞，会让人得出"这段时间没人动过"的
++    // 错误结论，而错误结论比没有结论更贵。
++    installUiEventRecorder();
+ }
+ 
+ 
+diff --git a/src/ui/PointCloudTestDialog.hpp b/src/ui/PointCloudTestDialog.hpp
+index 4bd4c99..a3383ab 100644
+--- a/src/ui/PointCloudTestDialog.hpp
++++ b/src/ui/PointCloudTestDialog.hpp
+@@ -592,6 +592,21 @@ private:
+     // 而按钮回调里再写一遍 if 会让那段本来就长的 lambda 更难读。
+     void recordRomEvent(int code, const QString& text, int intA);
+ 
++    // ---- 面板控件操作的全量事件记录（v8.1，实现在 _uievents.cpp）----
++    // 【为什么要全量】面板 87 个控件，而 1Hz 的 runtimeConfig 只覆盖 26 个，
++    // 逐帧 RunFlags 只有 20 个布尔位 —— 剩下的值在文件里【一个字节都没有】。
++    // 而且 runtimeConfig 是 1 秒一采样：一次"调大看看→不对→调回去"全程
++    // 不到一秒，在文件里完全不存在，偏偏这种试探性调整是排查现场最常发生、
++    // 事后最容易被本人忘掉的事。
++    void installUiEventRecorder();
++    void recordUiEvent(const QString& name, const QString& kind,
++                       double newVal, double oldVal, const QString& newText);
++    QString uiControlName(QWidget* w, int ordinal) const;
++    // 【唯一的控件枚举口】快照和事件接线共用，保证同一个控件在两处叫同一个
++    // 名字 —— 否则基线和增量 join 不起来，而那是这两份数据唯一的用法。
++    QList<QPair<QWidget*, QString>> uiControls() const;
++    std::string uiSnapshotJson() const;
++
+     // ---- 块 23：UDP 输出闭环（v8 才真正接上）----
+     // 【为什么这一块非有不可】链路最后一环在系统内部完全查不到：包根本没发、
+     // 发了但对端没配、或者 M3DS/M3DQ 两个包的时间戳对不上导致下游插值出鬼。
+diff --git a/src/ui/PointCloudTestDialog_capture.cpp b/src/ui/PointCloudTestDialog_capture.cpp
+index 7a0ab5b..e6698f9 100644
+--- a/src/ui/PointCloudTestDialog_capture.cpp
++++ b/src/ui/PointCloudTestDialog_capture.cpp
+@@ -194,6 +194,19 @@ void PointCloudTestDialog::setUdpEndpoint(bool enabled, int port)
+ 
+ void PointCloudTestDialog::toggleRecording() {
+     if (recorder_.recording()) {
++        // ---- 停录前先把最终配置和停止事件写进去 ----
++        // 【顺序要紧】stop() 之后一个字节都写不进去了。而"停的时候是什么
++        // 配置"恰恰是最该有的一份 —— 否则要靠重放整条增量事件流才能算出来，
++        // 而重放本身是个会出错的步骤。
++        const qint64 wall = QDateTime::currentMSecsSinceEpoch() * 1000000LL;
++        recorder_.writeParamDelta(wall,
++            std::string("{\"uiSnapshotStop\":") + uiSnapshotJson() + "}");
++        recorder_.writeEvent(22, 0, wall, -1,
++                             std::string("停止录制"),
++                             double(recorder_.bytesWritten()) / 1048576.0,
++                             recorder_.queueLoad(),
++                             int(recorder_.chunksWritten()),
++                             int(recorder_.droppedChunks()));
+         recorder_.stop();
+         // 停录就关掉原始流采集：常态运行不该为调试每帧多拷 ~1.8KB。
+         if (skeletonWorker_) skeletonWorker_->setCaptureDebugStreams(false);
+@@ -238,6 +251,20 @@ void PointCloudTestDialog::toggleRecording() {
+         // 全量指派矩阵单独开：约 200KB/s，只有 Paranoid 档才值得。
+         skeletonWorker_->setCaptureFullAssign(recorder_.wantsParanoid());
+     }
++    // ---- 起录第一件事：把 87 个控件的当前值全打进去 ----
++    // 【为什么必须有这份基线】增量事件只记"被改动过的"。一个全程没被碰过的
++    // 控件不产生任何事件，它的值在文件里就是空白 —— 而"没被碰过的那些"
++    // 才是系统运行的大背景：出问题时要先确认其它东西都在预期位置，
++    // 才轮得到看变了的那几个。
++    {
++        const qint64 wall0 = QDateTime::currentMSecsSinceEpoch() * 1000000LL;
++        recorder_.writeParamDelta(wall0,
++            std::string("{\"uiSnapshotStart\":") + uiSnapshotJson() + "}");
++        recorder_.writeEvent(21, 0, wall0, -1,
++                             std::string("开始录制：") + fn.toStdString(),
++                             0.0, 0.0,
++                             recDetailCombo_ ? recDetailCombo_->currentIndex() : 1, 0);
++    }
+     recTimer_.restart();
+     recBtn_->setText(QStringLiteral("■ 停止"));
+     recMarkBtn_->setEnabled(true);
+diff --git a/src/ui/PointCloudTestDialog_uievents.cpp b/src/ui/PointCloudTestDialog_uievents.cpp
+new file mode 100644
+index 0000000..d869943
+--- /dev/null
++++ b/src/ui/PointCloudTestDialog_uievents.cpp
+@@ -0,0 +1,351 @@
++// ===========================================================================
++// PointCloudTestDialog_uievents.cpp —— 面板控件操作的全量事件记录。
++//
++// 【这个文件解决的是一个具体的排查困境】
++// 面板上有 87 个控件。而文件里能反推出控件值的只有两处：
++//   · 逐帧 RunFlags —— 20 个布尔位，只覆盖开关，不覆盖任何数值
++//   · 1Hz runtimeConfig —— 26 个字段
++// 也就是说【剩下 61 个控件的值，文件里一个字节都没有】。
++//
++// 更要命的是采样率：runtimeConfig 是 1 秒一份。一次"调大看看→不对→调回去"
++// 的操作全程不到一秒，在文件里【完全不存在】—— 而这种试探性调整恰恰是
++// 排查现场最常发生的事，也最容易在事后被本人忘掉。
++//
++// 于是有一类问题永远查不下去："录之前/录之中，是不是有人动过什么？"
++// 这个问题不需要精妙的分析方法，只需要一份如实的操作流水。
++//
++// 【为什么用 findChildren 自动接线，而不是在 87 个控件上各写一句】
++// 手写 87 句的真正代价不是打字，是【漏】：新加一个控件时没人会记得
++// 补那一句，而漏掉的那一个按墨菲定律就是出问题的那一个。
++// 自动接线的覆盖率天然是 100%，且新控件自动纳入 —— 这不是省事，
++// 是把"完整性"从人的自觉变成机器的性质。
++//
++// 【控件名怎么来】优先 objectName()；按钮类用 text()（那正是用户点的
++// 那几个字）；数值框/下拉框回退到"同一布局里前面最近的 QLabel"——
++// 这个面板全部是"标签 + 控件"横排，命中率很高。都失败时退到
++// "类型#序号"，并且【如实记进快照】而不是假装有名字：
++// 一个叫 "QDoubleSpinBox#7" 的控件至少诚实，而一个猜错的名字会误导。
++// ===========================================================================
++#include "ui/PointCloudTestDialog.hpp"
++
++#include <QAbstractButton>
++#include <QAbstractSlider>
++#include <QCheckBox>
++#include <QComboBox>
++#include <QDateTime>
++#include <QDoubleSpinBox>
++#include <QGroupBox>
++#include <QLabel>
++#include <QLayout>
++#include <QLineEdit>
++#include <QPushButton>
++#include <QRadioButton>
++#include <QSpinBox>
++
++namespace mocap {
++
++namespace {
++
++// JSON 字符串转义。控件名里有中文、引号、反斜杠都可能。
++std::string jstr(const QString& s) {
++    std::string o = "\"";
++    for (const QChar& c : s) {
++        const ushort u = c.unicode();
++        if (u == '"')       o += "\\\"";
++        else if (u == '\\') o += "\\\\";
++        else if (u == '\n') o += "\\n";
++        else if (u == '\r') o += "\\r";
++        else if (u == '\t') o += "\\t";
++        else if (u < 0x20)  o += ' ';
++        else                o += QString(c).toUtf8().constData();
++    }
++    o += "\"";
++    return o;
++}
++
++// 找到【直接包含】该控件的那个布局。
++// 【为什么必须递归找，不能用 parentWidget()->layout()】
++// 面板全是「标签 + 控件」的横排行，而那个 QHBoxLayout 通常是嵌在
++// 外层 QVBoxLayout 里的【子布局】，本身没有自己的 QWidget。
++// 控件的 parentWidget() 是外层那个容器，parent->layout() 拿到的是
++// 外层 QVBoxLayout —— 控件根本不是它的直接项，于是一个都找不到。
++// 实测就是这么翻的车：所有数值框全退化成了 "QDoubleSpinBox#2" 这种编号名。
++QLayout* owningLayout(QLayout* lay, QWidget* w) {
++    if (!lay) return nullptr;
++    for (int i = 0; i < lay->count(); ++i) {
++        QLayoutItem* it = lay->itemAt(i);
++        if (!it) continue;
++        if (it->widget() == w) return lay;
++        if (QLayout* sub = it->layout())
++            if (QLayout* r = owningLayout(sub, w)) return r;
++    }
++    return nullptr;
++}
++
++// 在控件所在的那一行里，往前找最近的一个 QLabel 作为它的名字。
++// 【为什么找"前面"的】这个面板全部是横排的「标签: 控件」，标签在左。
++QString labelBefore(QWidget* w) {
++    QWidget* parent = w->parentWidget();
++    if (!parent) return QString();
++    QLayout* lay = owningLayout(parent->layout(), w);
++    if (!lay) return QString();
++    int idx = -1;
++    for (int i = 0; i < lay->count(); ++i)
++        if (lay->itemAt(i) && lay->itemAt(i)->widget() == w) { idx = i; break; }
++    if (idx < 0) return QString();
++    for (int i = idx - 1; i >= 0; --i) {
++        QLayoutItem* it = lay->itemAt(i);
++        if (!it || !it->widget()) continue;
++        if (auto* lb = qobject_cast<QLabel*>(it->widget())) {
++            QString t = lb->text().trimmed();
++            // 去掉尾部的冒号，跟 objectName 的风格统一
++            while (t.endsWith(QLatin1Char(':')) || t.endsWith(QStringLiteral("：")))
++                t.chop(1);
++            if (!t.isEmpty()) return t;
++        }
++        // 【碰到另一个控件就停】再往前找就串到上一行去了，
++        // 而一个张冠李戴的名字比没有名字危险得多。
++        if (qobject_cast<QAbstractButton*>(it->widget()) ||
++            qobject_cast<QAbstractSpinBox*>(it->widget()) ||
++            qobject_cast<QComboBox*>(it->widget()) ||
++            qobject_cast<QAbstractSlider*>(it->widget()))
++            break;
++    }
++    return QString();
++}
++
++// Qt 内部件。QSpinBox 里嵌着一个 QLineEdit、QComboBox 里嵌着 QLineEdit
++// 和一个下拉视图 —— 它们都是 findChildren 的合法结果，但【不是用户能操作
++// 的控件】。不过滤的后果实测有两个，第二个尤其坏：
++//   · 快照里混进一堆 "qt_spinbox_lineedit"，值跟宿主 spinbox 重复
++//   · 它们参与序号计数，于是【快照里的序号和事件里的序号对不上】——
++//     同一个控件在两处叫两个名字，基线和增量就再也 join 不起来了
++bool isQtInternal(QWidget* w) {
++    if (w->objectName().startsWith(QLatin1String("qt_"))) return true;
++    for (QWidget* p = w->parentWidget(); p; p = p->parentWidget()) {
++        if (qobject_cast<QAbstractSpinBox*>(p) || qobject_cast<QComboBox*>(p))
++            return true;
++    }
++    return false;
++}
++
++// 是不是我们要记录的控件类型。
++bool isTrackedControl(QWidget* w) {
++    return qobject_cast<QCheckBox*>(w)       || qobject_cast<QRadioButton*>(w) ||
++           qobject_cast<QComboBox*>(w)       || qobject_cast<QDoubleSpinBox*>(w) ||
++           qobject_cast<QSpinBox*>(w)        || qobject_cast<QAbstractSlider*>(w) ||
++           qobject_cast<QPushButton*>(w)     || qobject_cast<QLineEdit*>(w);
++}
++
++} // namespace
++
++// ---------------------------------------------------------------------------
++// 【唯一的控件枚举口】快照和事件接线都必须走这里。
++//
++// 分成两份各自 findChildren + 各自计数，实测立刻就错位了：快照把
++// spinbox 内部的 QLineEdit 也算进序号，于是同一个控件在快照里叫
++// "QSpinBox#4"、在事件里叫 "QSpinBox#3"。两处名字对不上，
++// 基线和增量就【再也 join 不起来】—— 而那正是这两份数据唯一的用法。
++// 过滤规则和序号只允许有一份实现。
++// ---------------------------------------------------------------------------
++QList<QPair<QWidget*, QString>> PointCloudTestDialog::uiControls() const {
++    QList<QPair<QWidget*, QString>> out;
++    int ord = 0;
++    for (QWidget* w : findChildren<QWidget*>()) {
++        if (!isTrackedControl(w) || isQtInternal(w)) continue;
++        ++ord;
++        out.append(qMakePair(w, uiControlName(w, ord)));
++    }
++    return out;
++}
++
++// ---------------------------------------------------------------------------
++// 控件名。优先级：objectName > 按钮文字 > 前面的标签 > 类型#序号
++// ---------------------------------------------------------------------------
++QString PointCloudTestDialog::uiControlName(QWidget* w, int ordinal) const {
++    if (!w) return QStringLiteral("?");
++    if (!w->objectName().isEmpty()) return w->objectName();
++    if (auto* b = qobject_cast<QAbstractButton*>(w)) {
++        QString t = b->text().trimmed();
++        t.remove(QLatin1Char('&'));            // 助记符
++        if (!t.isEmpty()) return t;
++    }
++    const QString lb = labelBefore(w);
++    if (!lb.isEmpty()) return lb;
++    // 【退到类型#序号，而不是猜】猜错的名字会把人引到错误的控件上，
++    // 而那种误导只会在你正拿它排查问题的时候发生。
++    return QStringLiteral("%1#%2").arg(QString::fromLatin1(w->metaObject()->className()))
++                                  .arg(ordinal);
++}
++
++// ---------------------------------------------------------------------------
++// 写一条控件操作事件（code 20）。
++// valueA=新值 valueB=旧值，都转成 double；下拉框用索引，按钮用 1。
++// ---------------------------------------------------------------------------
++void PointCloudTestDialog::recordUiEvent(const QString& name, const QString& kind,
++                                         double newVal, double oldVal,
++                                         const QString& newText)
++{
++    if (!recorder_.recording()) return;
++    const qint64 wall = QDateTime::currentMSecsSinceEpoch() * 1000000LL;
++    QString txt = name + QStringLiteral(" [") + kind + QStringLiteral("] ");
++    if (!newText.isEmpty()) txt += newText;
++    else                    txt += QString::number(oldVal, 'g', 6)
++                                 + QStringLiteral(" -> ")
++                                 + QString::number(newVal, 'g', 6);
++    // 【frameTsNs 传 -1 是刻意的】控件回调跑在 GUI 线程上，此刻的"当前帧"
++    // 是上一帧的残留，填进去等于伪造一个精确到帧的时刻。
++    // 墙钟是这条事件唯一诚实的时间轴；要跟帧对齐，靠前后两帧的墙钟去夹。
++    recorder_.writeEvent(20, 0, wall, -1, txt.toStdString(), newVal, oldVal, 0, 0);
++}
++
++// ---------------------------------------------------------------------------
++// 把面板上【每一个】控件的当前值打成 JSON。
++//
++// 【为什么光有增量事件不够，还必须有这份快照】
++// 事件记的是"从旧值变成新值"。而一个【全程没被碰过】的控件不会产生任何
++// 事件 —— 它的值在文件里就是空白。偏偏"没被碰过的那些"才是系统运行的
++// 大背景：出问题时要先确认"其它东西都在默认位置"，才轮得到看变了的那几个。
++//
++// 开始和停止各写一份：开始那份是所有增量的基线，停止那份让你不必重放
++// 一遍增量就能知道最终配置 —— 而重放本身是个会出错的步骤。
++// ---------------------------------------------------------------------------
++std::string PointCloudTestDialog::uiSnapshotJson() const {
++    std::string j = "{\"controls\":[";
++    bool first = true;
++    for (const auto& pr : uiControls()) {
++        QWidget* w = pr.first;
++        QString kind, val, extra;
++        if (auto* cb = qobject_cast<QCheckBox*>(w)) {
++            kind = QStringLiteral("check");
++            val = cb->isChecked() ? QStringLiteral("1") : QStringLiteral("0");
++        } else if (auto* rb = qobject_cast<QRadioButton*>(w)) {
++            kind = QStringLiteral("radio");
++            val = rb->isChecked() ? QStringLiteral("1") : QStringLiteral("0");
++        } else if (auto* co = qobject_cast<QComboBox*>(w)) {
++            kind = QStringLiteral("combo");
++            val = QString::number(co->currentIndex());
++            extra = QStringLiteral(",\"text\":") + QString::fromStdString(jstr(co->currentText()));
++        } else if (auto* ds = qobject_cast<QDoubleSpinBox*>(w)) {
++            kind = QStringLiteral("dspin");
++            val = QString::number(ds->value(), 'g', 9);
++            extra = QStringLiteral(",\"min\":%1,\"max\":%2")
++                        .arg(ds->minimum(), 0, 'g', 9).arg(ds->maximum(), 0, 'g', 9);
++        } else if (auto* sp = qobject_cast<QSpinBox*>(w)) {
++            kind = QStringLiteral("spin");
++            val = QString::number(sp->value());
++            extra = QStringLiteral(",\"min\":%1,\"max\":%2").arg(sp->minimum()).arg(sp->maximum());
++        } else if (auto* sl = qobject_cast<QAbstractSlider*>(w)) {
++            kind = QStringLiteral("slider");
++            val = QString::number(sl->value());
++            extra = QStringLiteral(",\"min\":%1,\"max\":%2").arg(sl->minimum()).arg(sl->maximum());
++        } else if (auto* le = qobject_cast<QLineEdit*>(w)) {
++            kind = QStringLiteral("text");
++            val = QStringLiteral("0");
++            extra = QStringLiteral(",\"text\":") + QString::fromStdString(jstr(le->text()));
++        } else if (auto* pb = qobject_cast<QPushButton*>(w)) {
++            // 【按钮也进快照】它没有"值"，但它的【可用性和文字】是状态：
++            // "结束ROM" 这四个字出现在按钮上，本身就说明当时正在标定。
++            kind = QStringLiteral("button");
++            val = pb->isEnabled() ? QStringLiteral("1") : QStringLiteral("0");
++            extra = QStringLiteral(",\"text\":") + QString::fromStdString(jstr(pb->text()));
++        } else {
++            continue;
++        }
++        if (!first) j += ",";
++        first = false;
++        j += "{\"name\":" + jstr(pr.second);
++        j += ",\"kind\":" + jstr(kind);
++        j += ",\"value\":" + val.toStdString();
++        j += ",\"enabled\":" + std::string(w->isEnabled() ? "true" : "false");
++        // 【tooltip 一起存】这些控件的 tooltip 里写着单位和量纲，
++        // 而"0.35 是弧度还是度"这种问题，事后没有 tooltip 就只能翻源码。
++        if (!w->toolTip().isEmpty()) {
++            QString tip = w->toolTip().section(QLatin1Char('\n'), 0, 0).left(120);
++            j += ",\"tip\":" + jstr(tip);
++        }
++        j += extra.toStdString();
++        j += "}";
++    }
++    j += "]}";
++    return j;
++}
++
++// ---------------------------------------------------------------------------
++// 给面板上所有控件接上操作事件。在 buildParamSections() 末尾调一次。
++//
++// 【lambda 里捕的是 QPointer 语义上的裸指针】这些控件的生命周期跟对话框
++// 一致，且 connect 的 context 就是 this，对话框析构时连接自动断开 ——
++// 不会出现悬垂调用。
++// ---------------------------------------------------------------------------
++void PointCloudTestDialog::installUiEventRecorder() {
++    for (const auto& pr : uiControls()) {
++        QWidget* w = pr.first;
++        const QString nm = pr.second;
++
++        if (auto* cb = qobject_cast<QCheckBox*>(w)) {
++            connect(cb, &QCheckBox::toggled, this, [this, nm](bool on) {
++                recordUiEvent(nm, QStringLiteral("check"), on ? 1 : 0, on ? 0 : 1,
++                              on ? QStringLiteral("关 -> 开") : QStringLiteral("开 -> 关"));
++            });
++        } else if (auto* rb = qobject_cast<QRadioButton*>(w)) {
++            connect(rb, &QRadioButton::toggled, this, [this, nm](bool on) {
++                // 【只记选中】一组单选里取消选中总是伴随另一个选中，
++                // 两条一起记等于每次操作都写两遍，看起来像抖动。
++                if (on) recordUiEvent(nm, QStringLiteral("radio"), 1, 0,
++                                      QStringLiteral("被选中"));
++            });
++        } else if (auto* co = qobject_cast<QComboBox*>(w)) {
++            // 旧值要在信号之外自己记：currentIndexChanged 只给新值。
++            auto* prev = new int(co->currentIndex());
++            connect(co, &QComboBox::destroyed, this, [prev]() { delete prev; });
++            connect(co, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
++                    [this, nm, co, prev](int i) {
++                        recordUiEvent(nm, QStringLiteral("combo"), i, *prev,
++                                      QStringLiteral("%1 -> %2(%3)")
++                                          .arg(*prev).arg(i).arg(co->itemText(i)));
++                        *prev = i;
++                    });
++        } else if (auto* ds = qobject_cast<QDoubleSpinBox*>(w)) {
++            auto* prev = new double(ds->value());
++            connect(ds, &QDoubleSpinBox::destroyed, this, [prev]() { delete prev; });
++            connect(ds, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this,
++                    [this, nm, prev](double v) {
++                        recordUiEvent(nm, QStringLiteral("dspin"), v, *prev, QString());
++                        *prev = v;
++                    });
++        } else if (auto* sp = qobject_cast<QSpinBox*>(w)) {
++            auto* prev = new int(sp->value());
++            connect(sp, &QSpinBox::destroyed, this, [prev]() { delete prev; });
++            connect(sp, QOverload<int>::of(&QSpinBox::valueChanged), this,
++                    [this, nm, prev](int v) {
++                        recordUiEvent(nm, QStringLiteral("spin"), v, *prev, QString());
++                        *prev = v;
++                    });
++        } else if (auto* sl = qobject_cast<QAbstractSlider*>(w)) {
++            auto* prev = new int(sl->value());
++            connect(sl, &QAbstractSlider::destroyed, this, [prev]() { delete prev; });
++            // 【用 sliderReleased 而不是 valueChanged】拖动滑条会每像素发一次，
++            // 一次拖动能写出几百条事件，把真正的操作淹掉。
++            connect(sl, &QAbstractSlider::sliderReleased, this, [this, nm, sl, prev]() {
++                if (sl->value() != *prev) {
++                    recordUiEvent(nm, QStringLiteral("slider"), sl->value(), *prev, QString());
++                    *prev = sl->value();
++                }
++            });
++        } else if (auto* pb = qobject_cast<QPushButton*>(w)) {
++            if (pb->isCheckable()) {
++                connect(pb, &QPushButton::toggled, this, [this, nm](bool on) {
++                    recordUiEvent(nm, QStringLiteral("toggle"), on ? 1 : 0, on ? 0 : 1,
++                                  on ? QStringLiteral("按下") : QStringLiteral("弹起"));
++                });
++            } else {
++                connect(pb, &QPushButton::clicked, this, [this, nm]() {
++                    recordUiEvent(nm, QStringLiteral("click"), 1, 0, QStringLiteral("点击"));
++                });
++            }
++        }
++    }
++}
++
++} // namespace mocap
+diff --git a/tools/pcrec/__pycache__/pcrec.cpython-312.pyc b/tools/pcrec/__pycache__/pcrec.cpython-312.pyc
+index a6173a4..9ad0e5d 100644
+Binary files a/tools/pcrec/__pycache__/pcrec.cpython-312.pyc and b/tools/pcrec/__pycache__/pcrec.cpython-312.pyc differ
+diff --git a/tools/pcrec/pcrec.py b/tools/pcrec/pcrec.py
+index ba4a231..7d095d3 100644
+--- a/tools/pcrec/pcrec.py
++++ b/tools/pcrec/pcrec.py
+@@ -547,6 +547,8 @@ CLUSTERLINK_HDR = np.dtype([("tsNs", "<i8"), ("nTracks", "<u2"), ("nUnmatched",
+                             ("nCams", "u1"), ("_p", "u1", 3)], align=True)
+ 
+ # 事件码 -> 人话。【跟 C++ 那边的注释是同一张表】
++MARK_KIND = {0: "打标记(手动)", 1: "打标记(自动)", 2: "打标记(ROM)"}
++
+ EVENT_NAME = {
+     1: "手性变更", 2: "模板热替换", 3: "模板被拒", 4: "自标定阶段变化",
+     5: "看门狗松锁", 6: "看门狗退模板", 7: "模型切换", 8: "参数下发",
+@@ -554,6 +556,8 @@ EVENT_NAME = {
+     13: "后端初始化", 14: "用户操作", 15: "其它",
+     16: "按下ROM标定", 17: "按下结束ROM",
+     18: "ROM采样开始(帧)", 19: "ROM采样结束(帧)",
++    # ---- v8.1 ----
++    20: "面板操作", 21: "开始录制", 22: "停止录制",
+ }
+ TEMPLATE_REASON = {0: "录制开始", 1: "模板热替换", 2: "手性变更",
+                    3: "自标定提交", 4: "周期重录"}
+@@ -732,6 +736,126 @@ class Recording:
+     # 而排查最怕的就是两个人看同一份文件得出不同结论却不知道为什么。
+     # =====================================================================
+ 
++    def timeline(self, ui=True):
++        """整场录制的时间轴：操作事件 + 标记 + 标定节点，按墙钟排。
++
++        【为什么要有这一个】排查的第一个动作永远是"先看看这一场都发生了什么"。
++        以前这件事要分别去翻 events / marks / romcalib 三处再手工对齐时间 ——
++        而对齐时间正是最容易出错、且错了不会报错的一步。
++
++        ui=False 可以滤掉面板操作，只看关键节点。
++        """
++        rows = []
++        t0 = None
++        for ev, txt in self.events:
++            w = int(ev["wallNs"])
++            if int(ev["code"]) == 21:
++                t0 = w
++        for ev, txt in self.events:
++            code = int(ev["code"])
++            if not ui and code == 20:
++                continue
++            rows.append((int(ev["wallNs"]), code, EVENT_NAME.get(code, code), txt,
++                         int(ev["frameTsNs"])))
++        # marks 是 (wallNs, kind, text) 的三元组，不是 numpy 记录 —— 跟 events
++        # 的结构不同。【这一处实测踩过】三元组按二元组解包会当场炸，
++        # 而炸在这里比悄悄少一类标记好：少了的话没人会发现时间轴不全。
++        for mk in (self.marks or []):
++            rows.append((int(mk[0]), -1,
++                         MARK_KIND.get(int(mk[1]), "打标记"), str(mk[2]), -1))
++        rows.sort(key=lambda r: r[0])
++        if t0 is None and rows:
++            t0 = rows[0][0]
++        out = []
++        for w, code, name, txt, fts in rows:
++            rel = (w - t0) / 1e9 if t0 else 0.0
++            frame = f"  帧{fts}" if fts > 0 else ""
++            out.append(f"[{rel:7.2f}s] {name:<12} {txt}{frame}")
++        if not out:
++            return ["没有事件 —— v8.1 之前录的文件不记面板操作"]
++        return out
++
++    def ui_snapshot(self, which="start"):
++        """录制开始/停止那一刻，面板上每个控件的值。
++
++        which: "start" | "stop"
++        【为什么这份快照不可替代】增量事件只记被改动过的控件；一个全程没被
++        碰过的控件不产生任何事件，它的值在文件里就是空白。而"没被碰过的那些"
++        才是系统运行的大背景 —— 出问题时要先确认其它东西都在预期位置，
++        才轮得到看变了的那几个。
++        """
++        # param_deltas 里存的已经是解析好的 dict（load() 就 json.loads 过了），
++        # 不是原始字符串 —— 再 loads 一次会当场炸。
++        key = "uiSnapshotStart" if which == "start" else "uiSnapshotStop"
++        for _, d in (self.param_deltas or []):
++            if isinstance(d, dict) and key in d:
++                return d[key].get("controls", [])
++        return []
++
++    def ui_changes(self):
++        """把面板操作事件整理成"控件 -> 改动次数 / 最终值"。"""
++        from collections import OrderedDict
++        agg = OrderedDict()
++        for ev, txt in self.events:
++            if int(ev["code"]) != 20:
++                continue
++            name = txt.split(" [")[0]
++            a = agg.setdefault(name, {"n": 0, "first": None, "last": None, "txt": ""})
++            a["n"] += 1
++            if a["first"] is None:
++                a["first"] = float(ev["valueB"])
++            a["last"] = float(ev["valueA"])
++            a["txt"] = txt
++        if not agg:
++            return ["整场录制没有任何面板操作 —— 这本身是一条结论"]
++        out = [f"{'控件':<22}{'次数':>4}{'起始':>12}{'最终':>12}"]
++        for k, a in agg.items():
++            out.append(f"{k:<22}{a['n']:>4}{a['first']:>12.4g}{a['last']:>12.4g}")
++        return out
++
++    def fist_cycles(self, thresh=0.25):
++        """从 curl 里数出握拳次数和每次的起止帧。
++
++        【为什么用 curl 而不是关节角】curl 只用球心间距算，不经过腕部系、
++        不经过四元数、不经过 anchor —— 关节角失效的那些帧里它还活着。
++        这正是它能当标定相位判据的原因，拿来数握拳同理。
++
++        thresh: 归一化 curl 的高低阈值（迟滞用 thresh 和 1-thresh）。
++        """
++        if self.jointsolve is None or not len(self.jointsolve):
++            return ["没有块 32（JointSolve）"]
++        js = self.jointsolve
++        # 四指 curl 的均值，忽略无效
++        c = js["curl"][:, 1:]
++        v = js["curlValid"][:, 1:].astype(bool)
++        cm = np.where(v, c, np.nan)
++        with np.errstate(invalid="ignore"):
++            curl = np.nanmean(cm, axis=1)
++        ok = ~np.isnan(curl)
++        if ok.sum() < 10:
++            return ["curl 有效帧太少，数不出握拳"]
++        lo, hi = np.nanpercentile(curl, 5), np.nanpercentile(curl, 95)
++        if hi - lo < 1e-6:
++            return ["curl 全程没有变化 —— 没有做出握拳/张开动作"]
++        u = (curl - lo) / (hi - lo)
++        # 迟滞：低于 thresh 算张开，高于 1-thresh 算握拳
++        state, cycles, start = 0, [], None
++        for i, x in enumerate(u):
++            if np.isnan(x):
++                continue
++            if state == 0 and x > 1 - thresh:
++                state, start = 1, i
++            elif state == 1 and x < thresh:
++                state = 0
++                if start is not None:
++                    cycles.append((start, i))
++        ts = js["frameTsNs"]
++        out = [f"共 {len(cycles)} 次握拳（curl 归一化，迟滞阈值 {thresh}）"]
++        for k, (a, b) in enumerate(cycles):
++            dur = (int(ts[b]) - int(ts[a])) / 1e9 if ts[a] > 0 and ts[b] > 0 else 0
++            out.append(f"  第{k+1}次  帧 {a}..{b}  ({dur:.1f}s)")
++        return out
++
+     def why_frozen(self, min_run=30):
+         """哪几维的输出不动了，以及【是哪条路造成的】。
+ 
+@@ -1538,5 +1662,48 @@ def flag_dict(bits):
+     return {n: bool(int(bits) & (1 << i)) for i, n in enumerate(RUNFLAG_NAMES)}
+ 
+ 
++def report(path_or_rec):
++    """一条命令把整场录制讲完：时间轴 -> 动作 -> 标定 -> 输出 -> 块健康度。
++
++    【为什么要有这个】排查的第一步永远是"先看看这一场发生了什么"，而这一步
++    以前要分别调七八个函数再手工对齐时间 —— 对齐时间正是最容易出错、
++    且错了不会报错的一步。顺序是按【因果】排的，不是按块号：
++    先看操作（人做了什么），再看动作（手做了什么），再看标定（系统学到了
++    什么），最后才看输出（结果对不对）。倒过来看必然会先怀疑输出。
++    """
++    r = load(path_or_rec) if isinstance(path_or_rec, str) else path_or_rec
++    L = []
++    def sec(title, lines):
++        L.append("")
++        L.append("=" * 72)
++        L.append(f"  {title}")
++        L.append("=" * 72)
++        L.extend(lines if isinstance(lines, list) else [lines])
++    sec("概览", r.summary().splitlines())
++    sec("① 时间轴：你做了什么", r.timeline())
++    sec("② 面板改动汇总", r.ui_changes())
++    sec("③ 握拳次数（从 curl 数，不依赖关节角）", r.fist_cycles())
++    sec("④ ROM 为什么标不满", r.why_rom_short())
++    sec("⑤ 输出冻结", r.why_frozen())
++    sec("⑥ 长期触限", r.why_clamped())
++    sec("⑦ 下游收不到数据？", r.why_output_missing())
++    sec("⑧ 块健康度（这一块为什么不在文件里）", r.block_report())
++    if r.schema_errors:
++        sec("⚠ schema 错误（有块被跳过了，结论可能不全）", r.schema_errors)
++    return "\n".join(L)
++
++
+ if __name__ == "__main__":
+-    print(load(sys.argv[1]).summary())
++    if len(sys.argv) > 2 and sys.argv[2] == "--report":
++        print(report(sys.argv[1]))
++    elif len(sys.argv) > 2 and sys.argv[2] in ("--timeline", "--chain", "--frozen"):
++        rr = load(sys.argv[1])
++        if sys.argv[2] == "--timeline":
++            print("\n".join(rr.timeline()))
++        elif sys.argv[2] == "--frozen":
++            print("\n".join(rr.why_frozen()))
++        else:
++            print("\n".join(rr.chain(int(sys.argv[3]) if len(sys.argv) > 3 else 6)))
++    else:
++        print(load(sys.argv[1]).summary())
++        print("\n（想看全场报告：python pcrec.py 文件.pcrec --report）")

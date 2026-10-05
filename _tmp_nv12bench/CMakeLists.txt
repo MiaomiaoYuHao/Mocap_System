@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.20)
+project(nv12bench LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 17)
+find_package(Qt6 REQUIRED COMPONENTS Core Gui Multimedia)
+add_executable(nv12bench main.cpp)
+target_link_libraries(nv12bench PRIVATE Qt6::Core Qt6::Gui Qt6::Multimedia)

@@ -1,0 +1,10 @@
+build/
+recordings/
+calib_sessions/
+calib_templates/
+*.exe
+*.dll
+*.onnx
+*.user
+__pycache__/
+*.pyc

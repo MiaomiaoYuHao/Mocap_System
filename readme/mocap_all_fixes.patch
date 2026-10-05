@@ -1,0 +1,963 @@
+--- orig/Mocap_System/src/camera/CameraLabel.hpp	2026-09-05 15:26:48.000000000 +0000
++++ work/Mocap_System/src/camera/CameraLabel.hpp	2026-09-10 01:55:00.205829734 +0000
+@@ -31,15 +31,23 @@
+ //   L2  alias：CalibrationLibrary::renameCamera() 里已经有了，
+ //       makeCameraLabel() 接受它并优先显示。
+ //
+-// 【接入点】
+-//   src/ui/AddCameraDialog.cpp   refresh() 里 occ 已经算了却没显示：
+-//       QString text = d.desc.isEmpty() ? "(未命名设备)" : d.desc;
+-//     ->  QString text = makeCameraLabel(d.desc, d.id, occ).display;
+-//   src/camera/WebcamCamera.cpp  ICamera 名字是裸的 dev.description()：
+-//       : ICamera(id, dev.description(), parent)
+-//     ->  : ICamera(id, makeCameraLabel(dev.description(), dev.id()).display, parent)
+-//   src/ui/DShowCaptureTestDialog.cpp  已经有 "(#N)" 但只有序号没有稳定标识，
+-//       重新插拔后序号会重排 —— 换成本文件的 label。
++// 【接入点 —— 两处必须传同一个编号，否则又会"两个界面两个名字"】
++//   src/camera/WebcamCamera.cpp  相机对象的名字，全 UI 都从这里取：
++//       : ICamera(id, makeCameraLabel(dev.description(), dev.id(),
++//                                     AppSettings().cameraNumber(dev.id())).display, parent)
++//     预览宫格、侧边栏相机列表、标定对话框与向导、同步监视器、参数对话框、
++//     重映射对话框，查过一遍全部落到 ICamera::name()。
++//   src/ui/AddCameraDialog.cpp   refresh() 里用【一模一样的形式】：
++//       makeCameraLabel(d.desc, d.id, settings.cameraNumber(d.id)).display
++//     编号两边都来自 AppSettings::cameraNumber()，而它拿 devicePathToInstanceId()
++//     归一化后的整条实例 ID 查表 —— DShow 枚举和 Qt 枚举给的两种路径写法会
++//     归一到同一个串，所以两边拿到的必然是同一个号。
++//     （不用 shortDeviceTag()：那只是实例 ID 的最后一段哈希，同 Hub 下是否
++//       必然不同没把握，撞了就是两台相机都显示 #1，而且看不出来。）
++//     【绝不要在任一侧现算序号】"同名设备里的第几个"会随插拔重排，
++//     "相机列表里的第几个"跟添加顺序走，两种都会让两个界面对不上号。
++//   src/ui/DShowCaptureTestDialog.cpp  自己拼的 "(#N)" 是枚举序，同样会漂，
++//       换成本文件的 label。
+ //
+ // 【occurrence 只能用来显示】它是"同名设备里的第几个"，重新插拔会重排。
+ // 任何持久化（标定库、remap 表、配置文件）都必须用 DevicePath / tag，
+@@ -53,9 +61,13 @@
+ namespace mocap {
+ 
+ struct CameraLabel {
+-    QString display;              // 界面上显示的整行
++    QString display;              // 界面上显示的整行，形如 "USB CAMERA #3"
+     QString tag;                  // 短标识：序列号，或端口派生的哈希
+-    QString location;             // "Port_#0002.Hub_#0004"，查不到时为空
++    // 【makeCameraLabel() 不再填这一项，永远是空】显示名里已经不带位置串了
++    // （七机位时每行长四十来个字符，标定向导底部那条汇总直接溢出窗口）。
++    // 谁真需要物理位置，自己调 queryUsbLocation(devicePath) —— 那是一次
++    // cfgmgr32 查询，不该让每次列表刷新都为它付钱（添加相机对话框 1Hz 轮询）。
++    QString location;
+     bool    fromSerial = false;   // true = tag 是真序列号，换口也不变
+ };
+ 
+@@ -133,21 +145,32 @@
+ // ---------------------------------------------------------------------------
+ // 组装最终显示名。
+ //
+-//   有别名:  左前机位 [Port_#0002.Hub_#0004]
+-//   无别名:  USB Camera #2 [Port_#0002.Hub_#0004]
+-//   查不到位置: USB Camera #2 [2B37306D]
+-//   什么都没有: USB Camera #2
++//   有别名:  左前机位
++//   无别名:  USB CAMERA #3
++//   没给编号: USB CAMERA
++//
++// 【为什么不再显示 [Port_#0002.Hub_#0004] / [2B37306D]】
++// 它确实是唯一能区分同型号相机的信息，但对着七台相机的界面实测下来是负担：
++// 每行长出四十来个字符，标定向导底部那条张数汇总直接横着溢出窗口右边，
++// 而用户真正要的只是"这是几号机位"。位置串该出现的地方是【相机重映射
++// 对话框】——那里就是专门回答"这个号现在对应哪台物理相机"的，不是每一行
++// 都挂着。
++//
++// 【编号从哪来】AppSettings::cameraNumber(devicePath)，按 DevicePath 派生的
++// 稳定 tag 持久化，重启/重新枚举/拖拽换位都不变。绝不要在这里现算序号 ——
++// 那正是"添加对话框 #3、退出去没号"那个 bug 的成因。
+ //
+-// occurrence < 0 表示"不知道是第几个"，那一段就不加。
++// number <= 0 表示"不知道是几号"，那一段就不加。
+ // ---------------------------------------------------------------------------
+ inline CameraLabel makeCameraLabel(const QString& friendlyName,
+                                    const QByteArray& devicePath,
+-                                   int occurrence = -1,
+-                                   const QString& alias = QString(),
+-                                   bool wantLocation = true) {
++                                   int number = -1,
++                                   const QString& alias = QString()) {
+     CameraLabel out;
+     out.tag = shortDeviceTag(devicePath, &out.fromSerial);
+-    if (wantLocation) out.location = queryUsbLocation(devicePath);
++    // location 不再默认查：它只给重映射对话框用，而那里会自己调
++    // queryUsbLocation()。原来每次列表刷新都对每台相机查一次 cfgmgr32，
++    // 添加相机对话框是 1Hz 轮询的，白烧。
+ 
+     const bool named = !alias.trimmed().isEmpty();
+     QString base = named ? alias.trimmed() : friendlyName.trimmed();
+@@ -155,9 +178,7 @@
+ 
+     QString text = base;
+     // 别名是用户自己起的，再加序号只是噪音
+-    if (!named && occurrence >= 0) text += QStringLiteral(" #%1").arg(occurrence + 1);
+-    const QString suffix = out.location.isEmpty() ? out.tag : out.location;
+-    if (!suffix.isEmpty()) text += QStringLiteral(" [%1]").arg(suffix);
++    if (!named && number > 0) text += QStringLiteral(" #%1").arg(number);
+ 
+     out.display = text;
+     return out;
+--- orig/Mocap_System/src/camera/WebcamCamera.hpp	2026-09-02 08:14:46.000000000 +0000
++++ work/Mocap_System/src/camera/WebcamCamera.hpp	2026-09-09 16:29:46.950558681 +0000
+@@ -90,6 +90,15 @@
+         // 接入时自动应用，保证 USB 相机一上来就跑满帧，而不是撞到低帧率默认档。
+         QCameraFormat bestFormat() const;
+ 
++    signals:
++        // 采集引擎每次(重)启动完成。【上层靠它补推硬件参数】——
++        // setFormat() 内部是 stopCapture()+startWithFormat()，等于把设备关掉
++        // 重开，之前推下去的曝光/亮度等会被驱动复位。谁想让硬件参数在换格式
++        // 之后仍然成立，就必须接这个信号、在它之后再推一次，而不是推完就走。
++        void captureEngineStarted(quint32 camId);
++
++    public:
++
+         // 算法通道开关：默认关闭。从主线程调用，转发给 worker（worker 里是 atomic）。
+         void setRawFrameEnabled(bool on);
+         bool rawFrameEnabled() const { return rawEnabled_; }
+--- orig/Mocap_System/src/camera/WebcamCamera.cpp	2026-09-05 16:13:47.000000000 +0000
++++ work/Mocap_System/src/camera/WebcamCamera.cpp	2026-09-09 16:36:50.522064131 +0000
+@@ -2,6 +2,7 @@
+ #include "camera/DShowCapture.hpp"
+ #include "camera/JpegDecoder.hpp"
+ #include "camera/CameraLabel.hpp"   // makeCameraLabel()：见构造函数那段说明
++#include "settings/AppSettings.hpp" // cameraNumber()：界面上那个稳定 #N
+ #include <QCamera>
+ #include <QVideoSink>
+ #include <QVideoFrame>
+@@ -109,6 +110,12 @@
+     void frameReady(quint32 camId, const QImage& img, double fps);
+     void rawFrameReady(quint32 camId, const QImage& gray, qint64 ts_ns);
+     void frameForDetect(quint32 camId, const QImage& img, qint64 ts_ns);
++    // 【采集引擎每次(重)起来都发一次】startCapture() 和 applyFormat() 都会走到
++    // startWithFormat()，而它是 new QCamera / new DShowCapture —— 也就是把设备
++    // 重新打开一遍。多数 UVC 驱动在最后一个句柄关闭时把 ProcAmp/CameraControl
++    // 复位回默认，所以【任何在这之前推下去的硬件参数都会被抹掉】。
++    // 上层拿这个信号在"设备确实开好了"之后再补推一次保存的参数。
++    void captureStarted();
+ 
+ private:
+     // 【引擎选择】压缩(MJPG)格式在这颗相机上被反复验证过：Qt/Media
+@@ -126,13 +133,16 @@
+ 
+ #ifdef _WIN32
+         if (!target.isNull() && isCompressedFormat(target.pixelFormat())) {
+-            if (startDshow(target)) return;
++            if (startDshow(target)) { emit captureStarted(); return; }
+             qWarning().noquote() << QStringLiteral(
+                 "[cam %1] DirectShow采集引擎启动失败，回退到Qt/Media Foundation路径"
+                 "(压缩格式下这条路径实测帧率可能明显偏低，见系统标定手册排查记录)").arg(id_);
+         }
+ #endif
+         startQtCamera(target);
++        // 【两条引擎路径都要发】不管走 DirectShow 还是 Qt，设备都被重新打开了，
++        // 上层要补推的硬件参数一样多。漏发一条 = 那条路径上参数静默丢失。
++        emit captureStarted();
+     }
+ 
+     bool startDshow(const QCameraFormat& target) {
+@@ -352,16 +362,18 @@
+ // 不差，所以界面上必然是六行一模一样的 "USB Camera"。换任何枚举方式都一样，
+ // 那不是 bug，是设备本身没提供可区分的信息（见 CameraLabel.hpp 开头）。
+ //
+-// 唯一能区分的信息一直在手上：DevicePath。makeCameraLabel() 从它里面取出
+-// 实例 ID 的最后一段（有序列号时就是序列号，没有时是父 Hub+端口派生的哈希），
+-// 再尽量查一下 USB 物理位置，拼成 "USB Camera [Port_#0002.Hub_#0004]"。
++// 【区分靠编号，不靠端口串】AppSettings::cameraNumber() 按 DevicePath 派生的
++// 稳定 tag 持久化一份 tag -> #N 的表，首次见到分配、此后永远是这个号：
++// 重启不变、枚举顺序变了不变、拖拽换位不变。添加相机对话框查的是同一张表，
++// 所以"对话框里选的 #3"和"加完之后列表里的 #3"必然是同一台。
+ //
+-// 【改这一行就够，不用逐个界面改】这正是所有界面共用一个取名口子的好处。
+-// 【occurrence 这里不传】它是"同名设备里的第几个"，重新插拔会重排，
+-// 而相机对象的名字是要长期显示的 —— 用一个会漂的序号反而误导。
+-// 添加相机对话框那种"当场枚举、当场选"的场景才适合用它。
++// 【为什么不再拼 [Port_#0002.Hub_#0004]】七台相机时每行长四十来个字符，
++// 标定向导底部那条张数汇总直接溢出窗口右边，而用户要的只是"几号机位"。
++// 位置串留给相机重映射对话框 —— 那里才是回答"这个号现在是哪台物理相机"的地方。
+ WebcamCamera::WebcamCamera(quint32 id, const QCameraDevice& dev, QObject* parent)
+-    : ICamera(id, makeCameraLabel(dev.description(), dev.id()).display, parent), dev_(dev) {}
++    : ICamera(id, makeCameraLabel(dev.description(), dev.id(),
++                                  AppSettings().cameraNumber(dev.id())).display, parent),
++      dev_(dev) {}
+ 
+ WebcamCamera::~WebcamCamera() { stop(); }
+ 
+@@ -386,6 +398,10 @@
+ 
+     connect(worker_, &CaptureWorker::frameReady,    this, &ICamera::frameReady);
+     connect(worker_, &CaptureWorker::rawFrameReady, this, &ICamera::rawFrameReady);
++    // 【跨线程，自动排队】worker 在采集线程里发，这里在主线程收 ——
++    // 接收方（CameraManager）要构造 DShowControl 推参数，那必须在主线程做。
++    connect(worker_, &CaptureWorker::captureStarted, this,
++            [this] { emit captureEngineStarted(id_); });
+ 
+     detectWorker_ = new DetectWorker;
+     detectThread_ = new QThread;
+--- orig/Mocap_System/src/camera/CameraManager.cpp	2026-09-02 08:14:46.000000000 +0000
++++ work/Mocap_System/src/camera/CameraManager.cpp	2026-09-10 01:46:56.992660552 +0000
+@@ -1,7 +1,6 @@
+ #include "camera/CameraManager.hpp"
+ #include "camera/VirtualCamera.hpp"
+ #include "camera/WebcamCamera.hpp"
+-#include "camera/DShowControl.hpp"
+ #include "settings/AppSettings.hpp"
+ #include <algorithm>
+ 
+@@ -24,17 +23,20 @@
+     cam->applyParams(defaults);
+     cam->start();
+ 
+-    // 【自动恢复上次保存的格式/曝光】以前这两项完全没有持久化——每次开机
+-    // 格式协商都走 pickBestFormat() 的固定优先级、曝光都是驱动默认(通常
+-    // 自动)，就算上次在参数面板手动调好了一套组合(比如未压缩格式+手动
+-    // 短曝光，规避某些相机在 Qt/Media Foundation 管线下压缩格式反而更慢
+-    // 的问题)，下次开机也会丢，得重新调一遍。这里读回 CamParamDialog 里
+-    // "应用格式"/"强制应用所选具体格式"/曝光行改动时存的偏好，开机直接
+-    // 自动套用，不用每次手动做。
++    // 【只恢复格式，硬件参数不在这里】格式属于采集引擎的事（分辨率/帧率决定
++    // 建图怎么建），归 CameraManager 管；亮度/曝光那一堆 DirectShow 属性属于
++    // "开机默认"这条策略，归 MainWindow 管 —— 见 MainWindow::hookCamera() 里
++    // 接 WebcamCamera::captureEngineStarted 的那段。
++    //
++    // 【为什么必须分开，不能图省事都塞这里】硬件参数有两个来源、有先后：
++    // Boot 模板（显式快照）先套，AppSettings 里那份曝光（改一下就自动存的，
++    // 总是更新）后套覆盖。而连接的触发顺序就是 connect 的调用顺序 ——
++    // 如果这里连一个、MainWindow 再连一个，这里的必然先跑，
++    // 顺序就反了：显式快照会盖掉用户后来改的曝光。统一在一处连，
++    // 顺序就是那一处代码的书写顺序，看得见、改得动。
+     {
+         AppSettings settings;
+         const auto prefs = settings.loadCameraPrefs(cam->deviceKey());
+-
+         if (prefs.hasFormat) {
+             for (const QCameraFormat& f : cam->formats()) {
+                 if (f.resolution() == prefs.resolution &&
+@@ -48,21 +50,6 @@
+             // 就什么都不做，维持 startCapture() 里 bestFormat() 选出来的
+             // 默认格式——不强行套用一个跟当前设备对不上的保存值。
+         }
+-
+-        if (prefs.hasExposure) {
+-            // 曝光走 DirectShow 属性接口，跟 CamParamDialog 用的是同一套
+-            // DShowControl，这里只是临时构造一次、推完值就丢，不需要常驻。
+-            DShowControl ctrl(cam->device().id(), cam->device().description(),
+-                              cam->nameOccurrenceIndex());
+-            if (ctrl.valid()) {
+-                for (const DShowProp& p : ctrl.properties()) {
+-                    if (p.name == QString::fromUtf8("\u66dd\u5149")) {
+-                        ctrl.set(p.id, p.isCameraControl, prefs.exposureValue, prefs.exposureAuto);
+-                        break;
+-                    }
+-                }
+-            }
+-        }
+     }
+ 
+     cams_.push_back(std::move(cam));
+--- orig/Mocap_System/src/settings/AppSettings.hpp	2026-09-02 08:14:46.000000000 +0000
++++ work/Mocap_System/src/settings/AppSettings.hpp	2026-09-09 16:35:28.748630445 +0000
+@@ -44,6 +44,22 @@
+                           int pixelFormat, double frameRate);
+     void saveCameraExposure(const QString& deviceKey, bool isAuto, long value);
+ 
++    // ---- 稳定相机编号（界面上那个 "#N"）----
++    //
++    // 【为什么必须持久化，不能现算】现算的序号有两种，都不能用：
++    //   a) "同名设备里的第几个"（枚举序）—— 插拔一次就重排，而且添加对话框
++    //      走 DirectShow 枚举、相机对象走 Qt 枚举，两份顺序不保证一致；
++    //   b) "相机列表里的第几个"（mgr_ 下标）—— 先加 3 号再加 1 号就错位，
++    //      而且拖拽换位会让编号跟着位置跑，"3 号相机"指的是哪台就说不清了。
++    // 两种都会出现"同一台相机在两个界面里是两个号"，正是要修的问题。
++    //
++    // 这里按 DevicePath 派生的稳定 tag 存一份 tag -> N 的表，首次见到分配
++    // 最小可用编号，此后【永远是这个号】：重启不变、枚举顺序变了不变、
++    // 拖拽换位不变。tag 的含义见 CameraLabel.hpp —— 有序列号的设备换 USB 口
++    // 也认得出，没序列号的按端口认（换口 = 新号，那本来就该当成另一台，
++    // 标定外参也对不上了，相机重映射对话框就是处理这件事的）。
++    int cameraNumber(const QByteArray& devicePath);
++
+ private:
+     QSettings s_;
+ };
+--- orig/Mocap_System/src/settings/AppSettings.cpp	2026-09-02 08:14:46.000000000 +0000
++++ work/Mocap_System/src/settings/AppSettings.cpp	2026-09-10 01:39:32.523191021 +0000
+@@ -1,4 +1,6 @@
+ #include "settings/AppSettings.hpp"
++#include "camera/CameraLabel.hpp"   // shortDeviceTag()：编号的键要跟标签用同一套归一化
++#include <QSet>
+ 
+ namespace mocap {
+ 
+@@ -71,4 +73,49 @@
+     s_.sync();
+ }
+ 
++int AppSettings::cameraNumber(const QByteArray& devicePath) {
++    // 【键用 devicePathToInstanceId()，不是 shortDeviceTag()】两点考虑：
++    //
++    // 1) 必须能吸收两套枚举的写法差异。DirectShow 的 DevicePath 和 Qt 的
++    //    QCameraDevice::id() 是同一条内核符号链接的两种写法（大小写、尾部
++    //    \global、接口 GUID 都可能不同）。直接拿路径当键，同一台相机会分到
++    //    两个号 —— 而"添加相机对话框走 DShow 枚举、相机对象走 Qt 枚举"
++    //    恰恰就是这两条路。devicePathToInstanceId() 把两种写法归一化成同一个
++    //    串（截 #{guid}、砍 \global、'#'→'\'、转大写），四种写法实测收敛。
++    //
++    // 2) 【为什么不用 shortDeviceTag()】它只取实例 ID 的最后一段哈希，比如
++    //    8&2B37306D&0&0000 里的 2B37306D。那一段是父节点派生的，在这套
++    //    七机位、两个 Hub 的现场，同一 Hub 下的设备是否必然不同没有把握 ——
++    //    一旦相同，两台相机会拿到同一个号，而且是【静默】的：界面上就是两行
++    //    "USB CAMERA #1"，看不出谁是谁，比原来显示端口串还糟。
++    //    整条实例 ID 是 Windows 保证唯一的，不用赌。
++    //    （tag 仍然有用，那是重映射对话框判断"换口了还是换机器了"的依据，
++    //      跟"给用户一个能念的号"是两件事。）
++    QString key = sanitizeDeviceKey(devicePathToInstanceId(devicePath));
++    if (key.isEmpty()) {
++        // 兜底：路径形态不认识时退回整条原始路径。分不到稳定键也好过不给号，
++        // 但这种设备换个写法枚举出来会另占一个号 —— 不该发生，也不假装没事。
++        key = sanitizeDeviceKey(QString::fromLatin1(devicePath));
++        if (key.isEmpty()) return -1;
++    }
++
++    s_.beginGroup(QStringLiteral("cam_number"));
++    int n = s_.value(key, 0).toInt();
++    if (n <= 0) {
++        // 分配最小可用编号。【不是"已有数量+1"】—— 那样删掉中间一台再加回来
++        // 会撞号，两台相机同时显示 #3。
++        QSet<int> used;
++        for (const QString& k : s_.childKeys()) {
++            const int v = s_.value(k, 0).toInt();
++            if (v > 0) used.insert(v);
++        }
++        n = 1;
++        while (used.contains(n)) ++n;
++        s_.setValue(key, n);
++        s_.sync();
++    }
++    s_.endGroup();
++    return n;
++}
++
+ } // namespace mocap
+--- orig/Mocap_System/src/settings/ParamPresets.hpp	2026-09-02 08:14:46.000000000 +0000
++++ work/Mocap_System/src/settings/ParamPresets.hpp	2026-09-10 01:44:47.993610108 +0000
+@@ -1,8 +1,11 @@
+ #pragma once
+ // ---------------------------------------------------------------------------
+-// 相机硬件参数模板（快照式）。两套：
++// 相机硬件参数模板（快照式）。三套：
+ //   Board —— “标定板”参数：默认状态即可拍清 ChArUco 黑白格
+ //   Track —— “追踪”参数：调到背景黑、反光球白
++//   Boot  —— “开机默认”：菜单里「存为开机默认」一键快照，开机自动套回去。
++//            前两套是【手动切换】的工况模板，这一套是【开机自动应用】的，
++//            用户不会去点它，所以别把它放进「应用 ▾」下拉里。
+ // 用法：先用参数对话框把画面调满意 -> “存为模板”一键快照全部相机的
+ // DirectShow 属性（值 + 自动标志）；之后一键应用，全部相机立即生效。
+ // 按 deviceKey 保存，落盘 JSON，重启不丢。标定向导按步骤自动切换模板。
+@@ -18,7 +21,9 @@
+ 
+ class ParamPresets {
+ public:
+-    enum Which { Board = 0, Track = 1 };
++    // 【加新槽位就得同步三处】enum、sets_ 的维度、.cpp 里的 kNames[]。
++    // 漏掉任何一处都是越界或静默读不到，编译器不会提醒。
++    enum Which { Board = 0, Track = 1, Boot = 2, WhichCount = 3 };
+ 
+     ParamPresets();   // 自动从用户配置目录载入 param_presets.json
+ 
+@@ -27,7 +32,17 @@
+ 
+     // 把模板 w 应用到这些相机（逐属性下发驱动，立即生效）。
+     // 返回成功应用的相机数；没有保存记录的相机跳过。
+-    int applyAll(Which w, const QList<WebcamCamera*>& cams);
++    int applyAll(Which w, const QList<WebcamCamera*>& cams) const;
++
++    // 单台相机版。【开机恢复要用这个，不能用 applyAll】开机时每台相机的
++    // 采集引擎是各自异步起来的，谁先起来谁先套 —— 拿整份列表去 applyAll
++    // 会对还没起来的相机白推一遍（那时推下去的值会被它自己的建图冲掉）。
++    // 见 MainWindow::hookCamera() 里接 captureEngineStarted 的那段。
++    bool applyTo(Which w, WebcamCamera* cam) const;
++
++    // 这台相机在模板 w 里有没有记录。has() 是"整套模板非空"，
++    // 这个是"具体这一台有没有"——七台相机里只存过三台时两者不是一回事。
++    bool hasFor(Which w, const QString& deviceKey) const;
+ 
+     bool has(Which w) const { return !sets_[w].isEmpty(); }
+     bool save() const;
+@@ -35,7 +50,7 @@
+ 
+ private:
+     struct P { long id; bool cc; long v; bool a; };   // 属性id/是否CameraControl/值/自动
+-    QHash<QString, QVector<P>> sets_[2];              // deviceKey -> 属性列表
++    QHash<QString, QVector<P>> sets_[WhichCount];     // deviceKey -> 属性列表
+     QString path_;
+     void load();
+ };
+--- orig/Mocap_System/src/settings/ParamPresets.cpp	2026-09-05 17:16:27.000000000 +0000
++++ work/Mocap_System/src/settings/ParamPresets.cpp	2026-09-10 01:45:17.689909332 +0000
+@@ -11,7 +11,9 @@
+ 
+ namespace mocap {
+ 
+-static const char* kNames[2] = { "board", "track" };
++// 【新增槽位记得同步 .hpp 的 enum 和 sets_ 维度】JSON 里多一个 "boot" 段，
++// 老配置文件没有这个键时 load() 读出来就是空的，向后兼容，不需要迁移。
++static const char* kNames[ParamPresets::WhichCount] = { "board", "track", "boot" };
+ 
+ ParamPresets::ParamPresets() {
+     QString dir = QStandardPaths::writableLocation(QStandardPaths::AppConfigLocation);
+@@ -26,8 +28,9 @@
+     for (WebcamCamera* c : cams) {
+         // 这里必须传裸的 device().description()（DirectShow FriendlyName），不能传
+         // c->name()：USB 同名相机修复后 name() 已被 makeCameraLabel() 拼成带
+-        // "#序号 [位置/哈希]" 的显示名，而 DShowControl 退化的按名字匹配要跟
+-        // DirectShow 的 FriendlyName 精确相等，传显示名会全部绑不上。
++        // "#机位号" 的显示名（2026-09 起不再带 [位置/哈希]，但仍然带 #N），
++        // 而 DShowControl 退化的按名字匹配要跟 DirectShow 的 FriendlyName
++        // 精确相等，传显示名会全部绑不上。
+         DShowControl ctl(c->device().id(), c->device().description(), c->nameOccurrenceIndex());
+         if (!ctl.valid()) continue;
+         QVector<P> list;
+@@ -43,27 +46,40 @@
+     return ok;
+ }
+ 
+-int ParamPresets::applyAll(Which w, const QList<WebcamCamera*>& cams) {
++bool ParamPresets::hasFor(Which w, const QString& deviceKey) const {
++    return sets_[w].contains(deviceKey);
++}
++
++int ParamPresets::applyAll(Which w, const QList<WebcamCamera*>& cams) const {
+     int ok = 0;
+-    for (WebcamCamera* c : cams) {
++    for (WebcamCamera* c : cams)
++        if (applyTo(w, c)) ++ok;
++    return ok;
++}
++
++// 单台版。applyAll 现在只是它的循环外壳，两条路径共用同一份下发逻辑，
++// 不会出现"批量能套上、开机单台套不上"这种两份实现走样的问题。
++bool ParamPresets::applyTo(Which w, WebcamCamera* c) const {
++    if (!c) return false;
++    {
+         const auto it = sets_[w].constFind(c->deviceKey());
+-        if (it == sets_[w].constEnd()) continue;
++        if (it == sets_[w].constEnd()) return false;
+         // 这里必须传裸的 device().description()（DirectShow FriendlyName），不能传
+         // c->name()：USB 同名相机修复后 name() 已被 makeCameraLabel() 拼成带
+-        // "#序号 [位置/哈希]" 的显示名，而 DShowControl 退化的按名字匹配要跟
+-        // DirectShow 的 FriendlyName 精确相等，传显示名会全部绑不上。
++        // "#机位号" 的显示名（2026-09 起不再带 [位置/哈希]，但仍然带 #N），
++        // 而 DShowControl 退化的按名字匹配要跟 DirectShow 的 FriendlyName
++        // 精确相等，传显示名会全部绑不上。
+         DShowControl ctl(c->device().id(), c->device().description(), c->nameOccurrenceIndex());
+-        if (!ctl.valid()) continue;
++        if (!ctl.valid()) return false;
+         for (const P& p : it.value())
+             ctl.set(p.id, p.cc, p.v, p.a);
+-        ++ok;
+     }
+-    return ok;
++    return true;
+ }
+ 
+ bool ParamPresets::save() const {
+     QJsonObject root;
+-    for (int w = 0; w < 2; ++w) {
++    for (int w = 0; w < WhichCount; ++w) {
+         QJsonObject setObj;
+         for (auto it = sets_[w].constBegin(); it != sets_[w].constEnd(); ++it) {
+             QJsonArray arr;
+@@ -88,7 +104,7 @@
+     if (!f.open(QIODevice::ReadOnly)) return;
+     const QJsonDocument doc = QJsonDocument::fromJson(f.readAll());
+     if (!doc.isObject()) return;
+-    for (int w = 0; w < 2; ++w) {
++    for (int w = 0; w < WhichCount; ++w) {
+         sets_[w].clear();
+         const QJsonObject setObj = doc.object()[kNames[w]].toObject();
+         for (auto it = setObj.constBegin(); it != setObj.constEnd(); ++it) {
+--- orig/Mocap_System/src/ui/AddCameraDialog.cpp	2026-09-05 16:13:47.000000000 +0000
++++ work/Mocap_System/src/ui/AddCameraDialog.cpp	2026-09-10 01:54:53.649785083 +0000
+@@ -1,6 +1,7 @@
+ #include "ui/AddCameraDialog.hpp"
+ #include "camera/DShowControl.hpp"     // enumerateVideoDevices()：只读属性包的轻量枚举
+-#include "camera/CameraLabel.hpp"      // makeCameraLabel()：把六行 "USB Camera" 变成可区分的
++#include "camera/CameraLabel.hpp"      // makeCameraLabel()：把七行 "USB CAMERA" 变成可区分的
++#include "settings/AppSettings.hpp"     // cameraNumber()：跟相机对象共用的那张编号表
+ #include <QMediaDevices>
+ #include <QHash>
+ #include <QListWidget>
+@@ -115,22 +116,30 @@
+         }
+     }
+ 
++    // ---- 显示名：跟相机对象的 name() 用【同一条规则、同一张编号表】 ----
++    // 【原来为什么对不上】这里传的是 d.occ（"同名设备里的第几个"，DShow 枚举序），
++    // 而 WebcamCamera 构造时压根没传编号，于是同一台相机在这里叫
++    // "USB CAMERA #3 [Port_#0001.Hub_#0005]"、加完退出去（侧边栏、宫格、
++    // 标定向导、同步监视器…… 全部取 ICamera::name()）却叫
++    // "USB CAMERA [Port_#0001.Hub_#0005]"，用户对不上号。
++    //
++    // 【为什么不能靠现算的序号对齐】d.occ 数的是设备枚举序，插拔一次就重排；
++    // 而且这个对话框走 DirectShow 枚举、相机对象走 Qt 枚举，两份顺序不保证
++    // 一致。两边各算各的，早晚还是分叉。
++    //
++    // 现在两边都问 AppSettings::cameraNumber(devicePath) 要号，它拿
++    // devicePathToInstanceId() 归一化后的【整条实例 ID】查一张持久化的表 ——
++    // DShow 的 DevicePath 和 Qt 的 QCameraDevice::id() 会归一到同一个串，
++    // 所以必然是同一个号，而且重启不变、拖拽换位不变。
++    //
++    // 【QSettings 只建一次】cameraNumber() 会读注册表，devs_ 有七台，
++    // 在循环里 new 七个 QSettings 是白烧 —— 这个函数还是 1Hz 轮询调用的。
++    AppSettings settings;
+     for (int i = 0; i < devs_.size(); ++i) {
+         const DevEntry& d = devs_[i];
+-        // 【occ 一直算着却没显示】上面那个 seen 哈希已经在数"同名设备里的第几个"，
+-        // 但列表里显示的还是裸的 friendlyName —— 六台同型号相机的 iProduct
+-        // 一字不差，于是六行全是 "USB Camera"，用户只能靠行号猜自己选的是哪台，
+-        // 而行号会随插拔重排。见 CameraLabel.hpp 开头。
+-        //
+-        // makeCameraLabel 会拼成 "USB Camera #2 [Port_#0002.Hub_#0004]"：
+-        // 序号回答"列表里的第几个"，方括号里的位置/哈希回答"物理上是哪一台"。
+-        // 【这里传 occ 是对的】跟 WebcamCamera 那边不同 —— 这个对话框是
+-        // "当场枚举、当场选"，序号跟眼前这份列表严格对应；而相机对象的名字
+-        // 要长期显示，用会随插拔重排的序号反而误导。
+-        //
+         // 【显示归显示，持久化仍然只认 DevicePath】下面 onAccept() 的三梯匹配
+-        // 和 used_ 的判重用的都是 d.id，一个字都没改 —— occ 只能进文本。
+-        const QString text = makeCameraLabel(d.desc, d.id, d.occ).display;
++        // 和 used_ 的判重用的都是 d.id，一个字都没改。
++        const QString text = makeCameraLabel(d.desc, d.id, settings.cameraNumber(d.id)).display;
+         auto* item = new QListWidgetItem(text, list_);
+         item->setData(Qt::UserRole, i);
+         if (isUsed(d)) {
+--- orig/Mocap_System/src/ui/CalibResultView.cpp	2026-09-02 08:14:46.000000000 +0000
++++ work/Mocap_System/src/ui/CalibResultView.cpp	2026-09-10 01:55:27.405849418 +0000
+@@ -1,6 +1,7 @@
+ #include "ui/CalibResultView.hpp"
+ #include "ui/Theme.hpp"
+ #include "calib/CalibrationStore.hpp"
++#include "settings/AppSettings.hpp"   // cameraNumber()：跟全 UI 共用的那张机位编号表
+ 
+ #include <QListWidget>
+ #include <QPlainTextEdit>
+@@ -22,19 +23,25 @@
+ // 本来就是拿来保证唯一性用的，不能随便改短——两台同型号相机全靠这串区分，
+ // 改了标定库/参数模板存取全部对不上号。这里只是显示层面提取一个人看得懂
+ // 的短标签，deviceKey 本身在别处一个字节都不动。
+-// dedupeIndex>=0 时在标签末尾加 "#N"，用于两台相机 VID/PID 完全相同（同
+-// 型号）时互相区分——单看短标签分不出谁是谁的情况下才需要。
+-QString shortDeviceLabel(const QString& deviceKey, int dedupeIndex = -1) {
++// 【2026-09 改：编号改用全局那张表，不再自己数】原来的 dedupeIndex 是
++// "这份标定结果里同型号的第几台"，从 0 数起再 +1。它跟界面上到处显示的机位号
++// 【不是一回事】：标定结果里只涉及 3 台同型号相机时，这里的 "#2" 完全可能是
++// 机位 "#5"。两个都写作 #2 却指不同的相机，比干脆没有编号更容易看错。
++// 现在直接问 AppSettings::cameraNumber() 要号 —— 它按归一化实例 ID 查表，
++// deviceKey 的 "web:" 前缀 devicePathToInstanceId() 自己会剥掉，所以这里
++// 跟 ICamera::name() 拿到的必然是同一个号。
++QString shortDeviceLabel(const QString& deviceKey) {
+     static const QRegularExpression reVid("vid_([0-9a-fA-F]{4})");
+     static const QRegularExpression rePid("pid_([0-9a-fA-F]{4})");
+     const auto mv = reVid.match(deviceKey);
+     const auto mp = rePid.match(deviceKey);
+-    QString label;
+-    if (mv.hasMatch() && mp.hasMatch())
+-        label = QStringLiteral("USB相机 %1:%2").arg(mv.captured(1).toUpper(), mp.captured(1).toUpper());
+-    else
+-        label = deviceKey;   // 解析不出 VID/PID 就老实显示原始值，不瞎编短名
+-    if (dedupeIndex >= 0) label += QStringLiteral(" #%1").arg(dedupeIndex + 1);
++    if (!mv.hasMatch() || !mp.hasMatch())
++        return deviceKey;   // 解析不出 VID/PID（虚拟相机等）就老实显示原始值，
++                            // 也不给它编号 —— 那张表只管真实 USB 设备。
++    QString label = QStringLiteral("USB相机 %1:%2")
++                        .arg(mv.captured(1).toUpper(), mp.captured(1).toUpper());
++    const int n = AppSettings().cameraNumber(deviceKey.toLatin1());
++    if (n > 0) label += QStringLiteral(" #%1").arg(n);
+     return label;
+ }
+ } // namespace
+@@ -175,19 +182,13 @@
+     // 载入
+     keys_ = store_->keys();
+ 
+-    // 先算一遍不带序号的短标签，只有"两台相机 VID/PID 完全相同（同型号）
+-    // 导致短标签也撞了"的情况才补上 #1/#2 区分，不重复的不用碍眼地加序号。
++    // 【原来这里有一段"撞名了再补 #1/#2"的去重】现在不需要了：
++    // shortDeviceLabel() 拿的是 AppSettings::cameraNumber() 那个全局唯一的
++    // 机位号，同型号相机天然不会撞。而且那段去重补的序号是"这份标定结果里
++    // 的第几台"，跟界面上到处显示的机位号不是一回事 —— 两个都写作 #2 却指
++    // 不同相机，比没有编号更容易看错，所以是连同去重一起删掉，不是简化。
+     QStringList shortLabels(keys_.size());
+     for (int i = 0; i < keys_.size(); ++i) shortLabels[i] = shortDeviceLabel(keys_[i]);
+-    {
+-        QHash<QString, QVector<int>> byLabel;
+-        for (int i = 0; i < keys_.size(); ++i) byLabel[shortLabels[i]] << i;
+-        for (auto it = byLabel.constBegin(); it != byLabel.constEnd(); ++it) {
+-            if (it.value().size() <= 1) continue;
+-            for (int j = 0; j < it.value().size(); ++j)
+-                shortLabels[it.value()[j]] = shortDeviceLabel(keys_[it.value()[j]], j);
+-        }
+-    }
+ 
+     QVector<PoseView3D::Cam> pcams;
+     for (int i = 0; i < keys_.size(); ++i) {
+--- orig/Mocap_System/src/ui/CalibWizard.hpp	2026-09-02 08:14:46.000000000 +0000
++++ work/Mocap_System/src/ui/CalibWizard.hpp	2026-09-09 16:38:22.213277968 +0000
+@@ -257,6 +257,9 @@
+         QString pyExe() const;
+ 
+         // ② 覆盖度 / 内参预览 / 审查照片
++        // 底部「每台相机拍了几张」汇总条。三个调用点（翻页/自动连拍/拍照）
++        // 共用，别再各抄一份 —— 抄三份的后果就是改格式漏一处。
++        void refreshBoardCountsLabel();
+         void updateBoardCoverageLabel(quint32 camId);
+         void refreshReprojLabel();
+         void maybeRunIntrinsicsPreview(quint32 camId);
+--- orig/Mocap_System/src/ui/CalibWizard.cpp	2026-09-02 08:14:46.000000000 +0000
++++ work/Mocap_System/src/ui/CalibWizard.cpp	2026-09-10 01:54:40.283021980 +0000
+@@ -605,6 +605,18 @@
+     boardPreview_ = new PreviewPane;
+     v->addWidget(boardPreview_, 1);
+     boardCounts_ = new QLabel;
++    // 【必须开换行 —— 这一页唯一漏掉的一个】七台相机的张数汇总拼成一行大约
++    // 一百多个字符，不换行就横着长出窗口右边，而这个 QLabel 外面没有
++    // QScrollArea，超出去的部分【既看不到也滚不到】。同一页的覆盖度/重投影/
++    // 自动拍照三个标签都设了 wordWrap，只有它漏了。
++    boardCounts_->setWordWrap(true);
++    // 【显式声明纯文本】默认 Qt::AutoText 会猜内容是不是富文本。这条汇总里
++    // 拼着相机名，而相机名是驱动上报的 iProduct —— 含 '<' 或 '&' 的话会被
++    // 当成 HTML 解析，轻则名字缺一截，重则我们靠 '\n' 分的行被折叠成一行，
++    // 又回到"横着长出去"。
++    boardCounts_->setTextFormat(Qt::PlainText);
++    // 等宽 + 对齐分隔，七台相机扫读时数字能对上列，不用逐个找冒号。
++    boardCounts_->setStyleSheet(theme::monoCss(12.0));
+     v->addWidget(boardCounts_);
+ 
+     // 覆盖度反馈（点3）：3x3 粗网格，哪块区域还没拍过一目了然，不用凭感觉
+@@ -984,10 +996,7 @@
+     setAllDetect(needDetect);
+ 
+     if (id == 1 && boardCounts_) {
+-        QStringList parts;
+-        for (ICamera* c : cams_)
+-            parts << QString("%1: %2 张").arg(c->name()).arg(shotCount_.value(c->id(), 0));
+-        boardCounts_->setText(parts.join("   "));
++        refreshBoardCountsLabel();
+         if (camCombo_) {
+             updateBoardCoverageLabel(camCombo_->currentData().toUInt());
+             refreshReprojLabel();
+@@ -1054,12 +1063,7 @@
+                     // 不调 enterPage(1)：那个函数每次都会重新下发一遍参数模板到
+                     // 硬件，自动连拍每半秒调一次的话就是每半秒重发一次硬件参数，
+                     // 没必要还可能引入画面轻微卡顿。这里只更新计数/覆盖度文字。
+-                    if (boardCounts_) {
+-                        QStringList parts;
+-                        for (ICamera* c : cams_)
+-                            parts << QString("%1: %2 张").arg(c->name()).arg(shotCount_.value(c->id(), 0));
+-                        boardCounts_->setText(parts.join("   "));
+-                    }
++                    refreshBoardCountsLabel();
+                     if (boardAutoStatus_)
+                         boardAutoStatus_->setText(QStringLiteral(
+                                                       "自动连拍中… 刚存了一张（清晰度分数 %1）").arg(sharp, 0, 'f', 0));
+@@ -1224,6 +1228,37 @@
+ }
+ 
+ // ---------- ②-覆盖度 / 内参预览 ----------
++// 底部那条「每台相机拍了几张」的汇总。
++//
++// 【为什么单拎出来】原来这三行在 onPageChanged / 自动连拍回调 / 拍照回调里
++// 各抄了一份，改格式要改三处，漏一处就出现"同一条信息两种样子"。
++//
++// 显示上做了两件事：
++//   · 当前正在拍的那台前面加 "▶"，不用跟上面的下拉框来回对；
++//   · 0 张的显式标出来。拍标定板最常见的翻车就是"以为都拍了、其实漏了一台"，
++//     而挤在一行里的 0 和 15 扫过去看不出差别。
++void CalibWizard::refreshBoardCountsLabel() {
++    if (!boardCounts_) return;
++    const quint32 curId = camCombo_ ? camCombo_->currentData().toUInt() : quint32(-1);
++    QStringList parts;
++    for (ICamera* c : cams_) {
++        const int n = shotCount_.value(c->id(), 0);
++        // 【一次性三参替换，不要链式 .arg()】链式是逐个替换的：如果相机名
++        // 里恰好含有 "%1"（名字来自驱动上报的 iProduct，我们说了不算），
++        // 下一个 .arg() 会把它当占位符填掉。三参版本是同时替换，不会互相吃。
++        parts << QStringLiteral("%1%2   %3")
++                     .arg(c->id() == curId ? QString::fromUtf8("\u25b6 ")   // ▶
++                                           : QStringLiteral("   "),
++                          c->name(),
++                          n == 0 ? QStringLiteral("0 张（未拍）")
++                                 : QStringLiteral("%1 张").arg(n));
++    }
++    // 【一台一行，不靠 wordWrap 折】折点落在哪儿取决于窗口宽度，
++    // 一台相机的名字和张数可能被拆到两行去，正是原来"不易看"的一部分。
++    // wordWrap 仍然要开着：单台相机别名很长时那一行还得能折。
++    boardCounts_->setText(parts.join(QStringLiteral("\n")));
++}
++
+ void CalibWizard::updateBoardCoverageLabel(quint32 camId) {
+     if (!boardCoverageLabel_ || !camCombo_) return;
+     if (camCombo_->currentData().toUInt() != camId) return;   // 只展示当前选中相机的
+@@ -1409,12 +1444,7 @@
+     connect(undo, &QUndoStack::indexChanged, dlg, [this, rebuildList, camId] {
+         rebuildList();
+         updateBoardCoverageLabel(camId);
+-        if (boardCounts_) {
+-            QStringList parts;
+-            for (ICamera* c : cams_)
+-                parts << QString("%1: %2 张").arg(c->name()).arg(shotCount_.value(c->id(), 0));
+-            boardCounts_->setText(parts.join("   "));
+-        }
++        refreshBoardCountsLabel();
+     });
+ 
+     // 跟 CalibrationLibraryDialog.cpp 里那个"class destructor may have
+--- orig/Mocap_System/src/ui/MainWindow.hpp	2026-09-02 08:14:46.000000000 +0000
++++ work/Mocap_System/src/ui/MainWindow.hpp	2026-09-10 01:52:10.449894628 +0000
+@@ -133,7 +133,15 @@
+ 
+         void restoreCameras();               // 按 cfg_.cameraKeys 恢复上次的相机
+         QStringList currentCameraKeys() const;
++        // 【存盘用的清单，不等于当前活着的清单】开机时没枚举到的相机必须
++        // 保留在模板里，否则模板会一次比一次少、且永远回不来。见 .cpp 说明。
++        QStringList cameraKeysForSave() const;
++        // 开机 restoreCameras() 时想恢复、但在 QMediaDevices 里没找到的 key。
++        QStringList missingAtBoot_;
+         void hookCamera(ICamera* cam);       // 把新相机接到检测/监控/UDP
++        // 把这台相机保存过的硬件参数推回驱动。【只在采集引擎(重)启动完成后
++        // 调用】—— 早于它推下去的值会被建图重开设备时抹掉。见 .cpp 说明。
++        void restoreCameraHardwareParams(quint32 camId);
+         QList<class WebcamCamera*> webcams() const;   // 全部真实相机
+     };
+ 
+--- orig/Mocap_System/src/ui/MainWindow.cpp	2026-09-07 12:08:27.000000000 +0000
++++ work/Mocap_System/src/ui/MainWindow.cpp	2026-09-10 01:52:59.030972516 +0000
+@@ -17,6 +17,7 @@
+ #include "capture/FrameRecorder.hpp"
+ #include "camera/ICamera.hpp"
+ #include "camera/WebcamCamera.hpp"
++#include "camera/DShowControl.hpp"   // restoreCameraHardwareParams()：推曝光要用
+ #include "camera/JpegDecoder.hpp"
+ 
+ #include <QApplication>
+@@ -858,21 +859,120 @@
+             Qt::UniqueConnection);
+     connect(cam, &ICamera::frameReady, monitor_, &SyncMonitor::onFrame,
+             Qt::UniqueConnection);
++
++    // ---- 开机默认：硬件参数在采集引擎每次(重)起来之后补推 ----
++    // 【为什么不能在建相机时推完就走】WebcamCamera::setFormat() 是排队执行的，
++    // 真正跑的 applyFormat() 里是 stopCapture()+startWithFormat()，等于把设备
++    // 关掉重开；多数 UVC 驱动在最后一个句柄关闭时把 ProcAmp/CameraControl
++    // 复位回默认。推完就走 = 推下去的值必然被随后的重开抹掉。
++    // 交互路径同理：调好参数再去改分辨率，一样会被抹掉，接这个信号一并修好。
++    //
++    // 【必须用成员函数指针，不能用 lambda】Qt::UniqueConnection 对 lambda /
++    // functor 无效 —— 官方文档写明"只适用于连接到成员函数"。而且不是"无效
++    // 就退化成普通连接"这么轻：Qt 内部剥掉 UniqueConnection 标志位的那一步
++    // 在 if (type & UniqueConnection && slot) 里面，functor 的 slot 是 nullptr，
++    // 这个位会残留进 connectionType，于是 connectionType == Qt::AutoConnection
++    // 的判定不成立，跨线程信号被当成【直连】执行 —— DShowControl 的 COM 调用
++    // 会跑到采集线程上去。上面那三条连接用的都是成员函数指针，照着来。
++    if (auto* web = qobject_cast<WebcamCamera*>(cam)) {
++        connect(web, &WebcamCamera::captureEngineStarted, this,
++                &MainWindow::restoreCameraHardwareParams, Qt::UniqueConnection);
++    }
++}
++
++// 把这台相机保存过的硬件参数推回驱动。只在采集引擎(重)启动完成后调用。
++//
++// 【两个来源，顺序不能反】
++//   1) Boot 模板 —— 用户点「存为开机默认」那一刻的全量快照（17 项属性）。
++//   2) AppSettings 里那份曝光 —— 在参数面板拖曝光行时【随手就存】的，
++//      所以它总是不早于 Boot 快照。
++// 先套 Boot、再套曝光：用户存过开机默认之后又单独调了曝光，下次开机拿到的
++// 是他后调的那个值。反过来写就会用旧快照盖掉新调的曝光 —— 而且是静默的，
++// 用户只会觉得"曝光又没记住"。
++//
++// 【为什么曝光还留着单独一份】参数面板的属性行是 valueChanged 触发的，
++// 拖一下滑块要触发几十次。QSettings 扛得住(它自己攒着写)，但 Boot 模板落的是
++// JSON 全文件重写 —— 每拖一像素重写一次文件不可接受。所以模板只在显式点
++// 「存为开机默认」时写一次，曝光那条隐式路径维持原样。
++void MainWindow::restoreCameraHardwareParams(quint32 camId)
++{
++    // 【入参是 camId 不是指针】为的是能用成员函数指针连接（见 hookCamera）。
++    // 顺带白捡一层安全：相机在信号排队期间被移除的话，byId 返回 nullptr，
++    // 而不是拿着一个已经析构的指针去调 COM。
++    auto* web = qobject_cast<WebcamCamera*>(mgr_->byId(camId));
++    if (!web) return;
++
++    // 1) 全量快照
++    presets_.applyTo(ParamPresets::Boot, web);
++
++    // 2) 之后可能又单独改过的曝光
++    const auto p = AppSettings().loadCameraPrefs(web->deviceKey());
++    if (!p.hasExposure) return;
++    // 【每次都重新读，不用缓存的快照】用户在两次引擎重启之间改过曝光的话，
++    // 缓存值会把他刚调的又推回去。
++    DShowControl ctrl(web->device().id(), web->device().description(),
++                      web->nameOccurrenceIndex());
++    if (!ctrl.valid()) return;
++    for (const DShowProp& q : ctrl.properties()) {
++        if (q.name == QString::fromUtf8("\u66dd\u5149")) {   // 曝光
++            ctrl.set(q.id, q.isCameraControl, p.exposureValue, p.exposureAuto);
++            break;
++        }
++    }
+ }
+ 
+ void MainWindow::restoreCameras()
+ {
+     const auto avail = QMediaDevices::videoInputs();
++    missingAtBoot_.clear();
+     for (const QString& key : cfg_.cameraKeys) {
+         if (key == QStringLiteral("virt")) { mgr_->addVirtual(cfg_.defaults); continue; }
+         if (key.startsWith(QStringLiteral("web:"))) {
+             const QString devId = key.mid(4);
++            bool found = false;
+             for (const QCameraDevice& d : avail)
+-                if (QString::fromUtf8(d.id()) == devId) { mgr_->addWebcam(d, cfg_.defaults); break; }
++                if (QString::fromUtf8(d.id()) == devId) {
++                    mgr_->addWebcam(d, cfg_.defaults); found = true; break;
++                }
++            // 【没找到不能静默跳过 —— 这是"模板一次比一次少"的成因】
++            // avail 是构造函数里【一次性】取的快照。六台相机挂在 USB Hub 上
++            // 冷启动时，PnP 枚举完成得比主窗口构造慢是常事，慢的那台这一轮
++            // 就不在 avail 里。原来这里 for 循环找不到就什么都不做，然后
++            // closeEvent 又把"当前活着的清单"无条件写回去 —— 那台相机就
++            // 被永久从模板里抹掉了，之后每次开机都少一台，而且不会自己回来。
++            // 记下来，存盘时保留（见 cameraKeysForSave），并且明确提示用户。
++            if (!found) {
++                missingAtBoot_ << key;
++                qWarning().noquote()
++                    << QStringLiteral("[启动] 开机默认里的相机未找到，本次跳过但保留在模板中：%1").arg(key);
++            }
+         }
+     }
+ }
+ 
++// 存盘用的相机清单。
++//
++// 【为什么不能直接用 currentCameraKeys()】那是"此刻活着的相机"，而模板要表达
++// 的是"我希望开机有哪些相机"。两者在一种很常见的情况下会分叉：开机时某台
++// 相机还没枚举出来。用前者存盘，这台相机就从模板里消失了，而且因为它已经
++// 不在模板里，下次开机也不会再去找它 —— 一次偶发的枚举慢，变成永久性丢失。
++//
++// 规则：按上一份模板的顺序走一遍，活着的照抄；开机没找到、到现在也还没
++// 出现的【保留】；本次运行中新加的接在后面。用户在界面上主动删掉的相机
++// 既不在 live 里也不在 missingAtBoot_ 里，会被正常移除 —— 主动删除仍然生效。
++QStringList MainWindow::cameraKeysForSave() const
++{
++    QStringList live = currentCameraKeys();
++    QStringList out;
++    for (const QString& k : cfg_.cameraKeys) {
++        const int i = live.indexOf(k);
++        if (i >= 0) { out << k; live.removeAt(i); }        // 还活着，位置照旧
++        else if (missingAtBoot_.contains(k)) out << k;     // 开机没枚举到，留着
++    }
++    out += live;                                           // 本次新加的
++    return out;
++}
++
+ QStringList MainWindow::currentCameraKeys() const
+ {
+     QStringList keys;
+@@ -1266,19 +1366,61 @@
+         QStringLiteral("正在采集到 %1（再次点击停止）").arg(path));
+ }
+ 
++// 「存为开机默认」= 把此刻的整套状态快照下来，开机原样恢复。
++//
++// 【改之前它名不副实】原来只存相机清单 + 窗口几何 + 三个应用层值
++// (threshold/target_fps/show_overlay)，【完全不碰】每台相机的分辨率帧率和
++// 参数面板里那 17 项硬件属性。那两样是"顺手存的"：格式在你点「应用格式」
++// 那一刻才存，硬件属性里只有「曝光」在你拖那一行时才存，其余 16 项
++// (亮度/对比度/色调/饱和度/清晰度/伽玛/启用颜色/白平衡/逆光对比/增益/
++//  全景/倾斜/滚动/缩放/光圈/焦点) 一项都不存。
++// 于是用户调好一整套画面、点了「存为开机默认」、下次开机发现只回来一部分。
+ void MainWindow::saveAsDefault()
+ {
+-    cfg_.cameraKeys = currentCameraKeys();
++    cfg_.cameraKeys = cameraKeysForSave();
+     cfg_.windowGeometry = saveGeometry();
+     settings_.save(cfg_);
+-    statusBar()->showMessage(QStringLiteral("已保存：下次启动自动恢复当前相机布局"), 3000);
++
++    const auto cams = webcams();
++
++    // ---- 硬件属性：全量快照进 Boot 模板 ----
++    // 走 ParamPresets 而不是往 AppSettings 里再开一套 schema：它本来就是
++    // "按 deviceKey 存整份 DirectShow 属性表、落 JSON"，Board/Track 两套已经
++    // 在用、已经验证过，加个槽位就行。两套存储各存一半才是麻烦的开始。
++    const int nProps = presets_.captureAll(ParamPresets::Boot, cams);
++
++    // ---- 分辨率/帧率：逐台存当前生效值 ----
++    // 存的是 currentFormat() 而不是下拉框选的值 —— 用户可能改了下拉框没点
++    // 「应用格式」，那种情况下画面上跑的还是旧格式，快照要跟画面一致。
++    AppSettings st;
++    int nFmt = 0;
++    for (WebcamCamera* c : cams) {
++        const QCameraFormat f = c->currentFormat();
++        if (f.isNull()) continue;   // 引擎还没起来，读不到就不写，别拿空值把好的覆盖了
++        st.saveCameraFormat(c->deviceKey(), f.resolution(),
++                            int(f.pixelFormat()), f.maxFrameRate());
++        ++nFmt;
++    }
++
++    // ---- 说清楚到底存进去多少 ----
++    // 【不报"已保存"就完事】这个功能之前就是因为静默才让人以为存上了。
++    // 相机数、属性快照数、格式数不一致时用户能立刻看出来哪一步没成
++    // （典型：某台相机被别的程序独占，DShowControl 绑不上，属性就少一台）。
++    QString msg = QStringLiteral("已存为开机默认：%1 台相机，硬件参数 %2 台，格式 %3 台")
++                      .arg(cams.size()).arg(nProps).arg(nFmt);
++    if (nProps < cams.size() || nFmt < cams.size())
++        msg += QStringLiteral("（有相机没存上，多半是设备被占用或还没出图）");
++    if (!missingAtBoot_.isEmpty())
++        msg += QStringLiteral("；另有 %1 台本次开机未枚举到，已保留在模板中")
++                   .arg(missingAtBoot_.size());
++    statusBar()->showMessage(msg, 8000);
+ }
+ 
+ void MainWindow::closeEvent(QCloseEvent* e)
+ {
+     for (auto* rec : recorders_) { rec->stop(); rec->deleteLater(); }
+     recorders_.clear();
+-    cfg_.cameraKeys     = currentCameraKeys();
++    cfg_.cameraKeys     = cameraKeysForSave();
+     cfg_.windowGeometry = saveGeometry();
+     settings_.save(cfg_);
+     mgr_->clear();
+--- orig/Mocap_System/src/estimate/SkeletonAssocWorker.hpp	2026-09-07 12:08:27.000000000 +0000
++++ work/Mocap_System/src/estimate/SkeletonAssocWorker.hpp	2026-09-09 15:59:46.394288427 +0000
+@@ -893,12 +893,20 @@
+             romStateDumpNs_ = -1;
+             romSnapReq_ = 0;
+         }
+-        // 【dbg 出参】只在需要时传：ROM 标定期间必传（采样的门架在它上面），
+-        // 录制期间也传（块 32 要它）。平时传 nullptr，一条指令都不多执行。
+-        const bool wantJdbg = romOn || capDebug_.load();
++        // 【jdbg_ 必须无条件填 —— 它不只是调试出参】
++        // dofState 是【功能输入】：romMap_.apply() 用它判"这一维本帧可不可信"，
++        // 不可信就保持上一帧输出。而这条保持分支只在 rom_.ready() 之后才走得到，
++        // 于是旧写法（不录制就传 nullptr、并把 jdbg_ 清成全 0）的后果被
++        // "ROM 标定完成"这一刻精准引爆：
++        //   JointSolveDebug{} 的 dofState 全 0 == DofState::Missing
++        //   -> 16 维【全部】命中保持分支 -> 输出恒等于 last_
++        //   -> romMap_.reset() 后的第 1 帧算出一个值，第 2 帧起永久冻结。
++        // 症状就是"标完 ROM 关节角不动了；先点录制再标就正常"——
++        // 录制期间 capDebug_ 为真，dofState 是真值，保持分支才按设计工作。
++        // JointSolveDebug 只有几百字节，60~120Hz 下填它的开销可以忽略；
++        // 【不要再按开关传 nullptr】，除非同时把 apply() 的 state 入参也断掉。
+         ja_ = hm20::solveJointAngles(result, ja_, wristHold_, 24, jointMirror_, romOn,
+-                                     true, wantJdbg ? &jdbg_ : nullptr);
+-        if (!wantJdbg) jdbg_ = hm20::JointSolveDebug{};
++                                     true, &jdbg_);
+         // 【① 解算原始角：必须在平滑之前抓】下面一行 angSmooth_ 是【就地覆写】
+         // ja_.q 的，抓晚一步就永远拿不到未经平滑的值了 —— 而"解算本身有没有
+         // 解出来"和"解出来了但被平滑吃掉"是两个完全不同的问题。
